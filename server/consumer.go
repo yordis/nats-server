@@ -94,6 +94,8 @@ type ConsumerConfig struct {
 
 	// Don't add to general clients.
 	Direct bool `json:"direct,omitempty"`
+
+	eventsHBInterval time.Duration `json:"events_hb_interval,omitempty"`
 }
 
 // SequenceInfo has both the consumer and the stream sequence and last activity.
@@ -305,7 +307,8 @@ type consumer struct {
 	ptail *proposal
 
 	// Ack queue
-	ackMsgs *ipQueue
+	ackMsgs          *ipQueue
+	eventsHBInterval time.Duration
 }
 
 type proposal struct {
@@ -697,6 +700,10 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 		maxp:      config.MaxAckPending,
 		retention: retention,
 		created:   time.Now().UTC(),
+
+		// TODO: Do we need to validate that is required or put some value or just leave
+		// 	it?
+		eventsHBInterval: config.eventsHBInterval,
 	}
 
 	// Bind internal client to the user account.
@@ -1889,7 +1896,7 @@ func (o *consumer) checkAndSetPendingRequestsOk() {
 				if !versionAtLeast(si.(nodeInfo).version, 2, 7, 1) {
 					// We expect all of our peers to eventually be up to date.
 					// So check again in awhile.
-					time.AfterFunc(eventsHBInterval, func() { o.checkAndSetPendingRequestsOk() })
+					time.AfterFunc(o.eventsHBInterval, func() { o.checkAndSetPendingRequestsOk() })
 					o.setPendingRequestsOk(false)
 					return
 				}
