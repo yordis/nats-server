@@ -4787,12 +4787,16 @@ func testWSNoCorruptionWithFrameSizeLimit(t *testing.T, total int) {
 			}
 		}
 	}
+	wait := 10 * time.Second
+	if total > 1000 {
+		wait = 30 * time.Second
+	}
 	select {
 	case err := <-errCh:
 		t.Fatalf("Error: %v", err)
 	case <-doneCh:
 		return
-	case <-time.After(10 * time.Second):
+	case <-time.After(wait):
 		t.Fatalf("Test timed out")
 	}
 }

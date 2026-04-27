@@ -1824,10 +1824,12 @@ func TestJetStreamClusterStreamLastSequenceResetAfterStorageWipe(t *testing.T) {
 		for _, s := range c.servers {
 			for i := 1; i <= numStreams; i++ {
 				stream := fmt.Sprintf("TEST:%d", i)
-				mset, err := s.GlobalAccount().lookupStream(stream)
-				require_NoError(t, err)
-				var state StreamState
 				checkFor(t, 10*time.Second, 200*time.Millisecond, func() error {
+					mset, err := s.GlobalAccount().lookupStream(stream)
+					if err != nil {
+						return err
+					}
+					var state StreamState
 					mset.store.FastState(&state)
 					if state.LastSeq != 222 {
 						return fmt.Errorf("%v Wrong last sequence %d for %q - State  %+v", s, state.LastSeq, stream, state)
@@ -1907,6 +1909,7 @@ func TestJetStreamClusterAckFloorBetweenLeaderAndFollowers(t *testing.T) {
 func TestJetStreamClusterConsumerLeak(t *testing.T) {
 	N := 2000
 	NConcurrent := 25
+	jsOpts := []nats.JSOpt{nats.MaxWait(30 * time.Second)}
 
 	clusterConf := `
 	listen: 127.0.0.1:-1
@@ -1934,11 +1937,12 @@ func TestJetStreamClusterConsumerLeak(t *testing.T) {
 	defer cl.shutdown()
 	cl.waitOnLeader()
 
-	s := cl.randomNonLeader()
+	s := cl.leader()
+	require_NotNil(t, s)
 
 	// Create the test stream.
 	streamName := "LEAK_TEST_STREAM"
-	nc, js := jsClientConnect(t, s, nats.UserInfo("one", "p"))
+	nc, js := jsClientConnectEx(t, s, jsOpts, nats.UserInfo("one", "p"))
 	defer nc.Close()
 	_, err := js.AddStream(&nats.StreamConfig{
 		Name:      streamName,
@@ -1975,7 +1979,7 @@ func TestJetStreamClusterConsumerLeak(t *testing.T) {
 				wg.Done()
 			}()
 
-			nc, js := jsClientConnect(t, s, nats.UserInfo("one", "p"))
+			nc, js := jsClientConnectEx(t, s, jsOpts, nats.UserInfo("one", "p"))
 			defer nc.Close()
 
 			consumerName := "sessid_" + nuid.Next()

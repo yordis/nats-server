@@ -36,6 +36,7 @@ type memStore struct {
 	state       StreamState
 	msgs        map[uint64]*StoreMsg
 	fss         *stree.SubjectTree[SimpleState]
+	svs         *stree.SubjectTree[subjectVersionEntry]
 	dmap        avl.SequenceSet
 	maxp        int64
 	scb         StorageUpdateHandler
@@ -63,6 +64,9 @@ func newMemStore(cfg *StreamConfig) (*memStore, error) {
 		fss:  stree.NewSubjectTree[SimpleState](),
 		maxp: cfg.MaxMsgsPer,
 		cfg:  *cfg,
+	}
+	if cfg.subjectVersioningEnabled() {
+		ms.svs = stree.NewSubjectTree[subjectVersionEntry]()
 	}
 	// Only create a THW if we're going to allow TTLs.
 	if cfg.AllowMsgTTL {
@@ -103,6 +107,11 @@ func (ms *memStore) UpdateConfig(cfg *StreamConfig) error {
 		ms.recoverMsgSchedulingState()
 	} else if !cfg.AllowMsgSchedules && ms.scheduling != nil {
 		ms.scheduling = nil
+	}
+	if cfg.subjectVersioningEnabled() {
+		ms.recoverSubjectVersionStateLocked()
+	} else {
+		ms.svs = nil
 	}
 	// Limits checks and enforcement.
 	ms.enforceMsgLimit()
@@ -187,6 +196,50 @@ func (ms *memStore) recoverMsgSchedulingState() {
 		if schedule, apiErr := nextMessageSchedule(sm.hdr, sm.ts); apiErr == nil && !schedule.IsZero() {
 			ms.scheduling.init(seq, sm.subj, schedule.UnixNano())
 		}
+	}
+}
+
+// Lock should be held.
+func (ms *memStore) recoverSubjectVersionStateLocked() {
+	if !ms.cfg.subjectVersioningEnabled() {
+		ms.svs = nil
+		return
+	}
+	if ms.svs == nil {
+		ms.svs = stree.NewSubjectTree[subjectVersionEntry]()
+	} else {
+		ms.svs = ms.svs.Empty()
+	}
+	if ms.state.Msgs == 0 {
+		return
+	}
+
+	var (
+		seq uint64
+		smv StoreMsg
+		sm  *StoreMsg
+	)
+	for sm, seq, _ = ms.loadNextMsgLocked(fwcs, true, 0, &smv); sm != nil; sm, seq, _ = ms.loadNextMsgLocked(fwcs, true, seq+1, &smv) {
+		ms.updateSubjectVersionStateLocked(sm.hdr, sm.seq)
+	}
+}
+
+// Lock should be held.
+func (ms *memStore) updateSubjectVersionStateLocked(hdr []byte, seq uint64) {
+	if ms.svs == nil || len(hdr) == 0 {
+		return
+	}
+	key, version, ok := getSubjectVersionMetadata(hdr)
+	if !ok {
+		return
+	}
+	if sv, ok := ms.svs.Find(stringToBytes(key)); ok {
+		if seq >= sv.lastSeq {
+			sv.lastSeq = seq
+			sv.lastVersion = version
+		}
+	} else {
+		ms.svs.Insert(stringToBytes(key), subjectVersionEntry{lastVersion: version, lastSeq: seq})
 	}
 }
 
@@ -288,6 +341,7 @@ func (ms *memStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts, tt
 			ms.fss.Insert([]byte(subj), SimpleState{Msgs: 1, First: seq, Last: seq})
 		}
 	}
+	ms.updateSubjectVersionStateLocked(hdr, seq)
 
 	// Limits checks and enforcement.
 	ms.enforceMsgLimit()
@@ -1536,6 +1590,9 @@ func (ms *memStore) purge(fseq uint64) (uint64, error) {
 		ms.msgs = make(map[uint64]*StoreMsg)
 	}
 	ms.fss = stree.NewSubjectTree[SimpleState]()
+	if ms.svs != nil {
+		ms.svs = ms.svs.Empty()
+	}
 	ms.dmap.Empty()
 	ms.sdm.empty()
 	ms.mu.Unlock()
@@ -1614,6 +1671,9 @@ func (ms *memStore) compact(seq uint64) (uint64, error) {
 		ms.dmap.Empty()
 		ms.sdm.empty()
 	}
+	if ms.svs != nil {
+		ms.recoverSubjectVersionStateLocked()
+	}
 	ms.mu.Unlock()
 
 	if cb != nil {
@@ -1646,6 +1706,9 @@ func (ms *memStore) reset() error {
 	// Reset msgs, fss and dmap.
 	ms.msgs = make(map[uint64]*StoreMsg)
 	ms.fss = stree.NewSubjectTree[SimpleState]()
+	if ms.svs != nil {
+		ms.svs = ms.svs.Empty()
+	}
 	ms.dmap.Empty()
 	ms.sdm.empty()
 
@@ -1697,6 +1760,9 @@ func (ms *memStore) Truncate(seq uint64) error {
 		bytes = ms.state.Bytes
 	}
 	ms.state.Bytes -= bytes
+	if ms.svs != nil {
+		ms.recoverSubjectVersionStateLocked()
+	}
 
 	cb := ms.scb
 	ms.mu.Unlock()
@@ -2221,6 +2287,9 @@ func (ms *memStore) removeMsgNoCB(seq uint64, secure bool) (subj string, size ui
 
 	// Must delete message after updating per-subject info, to be consistent with file store.
 	delete(ms.msgs, seq)
+	if ms.svs != nil {
+		ms.recoverSubjectVersionStateLocked()
+	}
 
 	return sm.subj, size, true
 }

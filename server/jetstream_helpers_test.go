@@ -72,6 +72,11 @@ type supercluster struct {
 	nproxies []*netProxy
 }
 
+var (
+	jsClusterPortMu     sync.Mutex
+	jsClusterPortCursor = 7_022
+)
+
 func (sc *supercluster) shutdown() {
 	if sc == nil {
 		return
@@ -770,9 +775,7 @@ func createJetStreamClusterWithTemplate(t testing.TB, tmpl string, clusterName s
 }
 
 func createJetStreamClusterWithTemplateAndModHook(t testing.TB, tmpl string, clusterName string, numServers int, modify modifyCb) *cluster {
-	startPorts := []int{7_022, 9_022, 11_022, 15_022}
-	port := startPorts[rand.Intn(len(startPorts))]
-	return createJetStreamClusterAndModHook(t, tmpl, clusterName, _EMPTY_, numServers, port, true, modify)
+	return createJetStreamClusterAndModHook(t, tmpl, clusterName, _EMPTY_, numServers, reserveJetStreamClusterPortBlock(t, numServers), true, modify)
 }
 
 func createJetStreamCluster(t testing.TB, tmpl string, clusterName, snPre string, numServers int, portStart int, waitOnReady bool) *cluster {
@@ -786,9 +789,60 @@ func createJetStreamClusterAndModHook(t testing.TB, tmpl, cName, snPre string, n
 }
 
 func createJetStreamClusterWithNetProxy(t testing.TB, cName string, numServers int, cnp *clusterProxy) *cluster {
-	startPorts := []int{7_122, 9_122, 11_122, 15_122}
-	port := startPorts[rand.Intn(len(startPorts))]
-	return createJetStreamClusterEx(t, jsClusterTempl, cName, _EMPTY_, numServers, port, true, nil, cnp)
+	return createJetStreamClusterEx(t, jsClusterTempl, cName, _EMPTY_, numServers, reserveJetStreamClusterPortBlock(t, numServers), true, nil, cnp)
+}
+
+func reserveJetStreamClusterPortBlock(t testing.TB, numServers int) int {
+	t.Helper()
+
+	const (
+		firstPort = 7_022
+		lastPort  = 32_000
+		stride    = 32
+	)
+
+	tryReserve := func(base int) ([]net.Listener, bool) {
+		ls := make([]net.Listener, 0, numServers)
+		for port := base; port < base+numServers; port++ {
+			ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+			if err != nil {
+				for _, l := range ls {
+					l.Close()
+				}
+				return nil, false
+			}
+			ls = append(ls, ln)
+		}
+		return ls, true
+	}
+
+	jsClusterPortMu.Lock()
+	defer jsClusterPortMu.Unlock()
+
+	for start := jsClusterPortCursor; start+numServers-1 <= lastPort; start += stride {
+		if ls, ok := tryReserve(start); ok {
+			for _, l := range ls {
+				l.Close()
+			}
+			jsClusterPortCursor = start + stride
+			return start
+		}
+	}
+	for start := firstPort; start < jsClusterPortCursor; start += stride {
+		if start+numServers-1 > lastPort {
+			break
+		}
+		if ls, ok := tryReserve(start); ok {
+			for _, l := range ls {
+				l.Close()
+			}
+			jsClusterPortCursor = start + stride
+			return start
+		}
+	}
+
+	t.Fatalf("unable to reserve %d cluster route ports", numServers)
+	return 0
 }
 
 func createJetStreamClusterEx(t testing.TB, tmpl, cName, snPre string, numServers int, portStart int, wait bool, modify modifyCb, cnp *clusterProxy) *cluster {

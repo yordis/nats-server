@@ -2218,5 +2218,55 @@
     "help": "",
     "url": "",
     "deprecates": ""
+  },
+  {
+    "constant": "JSStreamExpectedLastSubjectVersionInvalidErr",
+    "code": 400,
+    "error_code": 10224,
+    "description": "invalid expected last subject version",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSStreamExpectedLastSubjectVersionRequiresVersioningErr",
+    "code": 400,
+    "error_code": 10225,
+    "description": "expected last subject version requires subject versioning",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSStreamSubjectVersionHeaderServerManagedErrF",
+    "code": 400,
+    "error_code": 10226,
+    "description": "{header} is server managed on subject versioned streams",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSStreamWrongLastSubjectVersionConstantErr",
+    "code": 400,
+    "error_code": 10227,
+    "description": "wrong last subject version",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSStreamWrongLastSubjectVersionErrF",
+    "code": 400,
+    "error_code": 10228,
+    "description": "wrong last subject version: {version}",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
   }
 ]

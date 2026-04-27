@@ -1,0 +1,199 @@
+// Copyright 2012-2026 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:build !skip_store_tests
+
+package server
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func testSubjectVersioningStreamConfig(name string, storage StorageType) StreamConfig {
+	return StreamConfig{
+		Name:       name,
+		Storage:    storage,
+		Subjects:   []string{"events.*.*.*"},
+		Retention:  LimitsPolicy,
+		MaxMsgs:    -1,
+		MaxBytes:   -1,
+		MaxAge:     0,
+		MaxMsgsPer: -1,
+		DenyDelete: true,
+		DenyPurge:  true,
+		SubjectVersioning: &SubjectVersioningConfig{
+			Mode: SubjectVersioningModeGapless,
+			SubjectTransform: &SubjectTransformConfig{
+				Source:      "events.*.*.*",
+				Destination: "events.$1.$2",
+			},
+		},
+	}
+}
+
+func TestJetStreamSubjectVersioningConfigValidation(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	tests := []struct {
+		name   string
+		mutate func(*StreamConfig)
+		want   string
+	}{
+		{
+			name: "max-age",
+			mutate: func(cfg *StreamConfig) {
+				cfg.MaxAge = time.Minute
+			},
+			want: "subject versioning requires max age to be disabled",
+		},
+		{
+			name: "message-ttl",
+			mutate: func(cfg *StreamConfig) {
+				cfg.AllowMsgTTL = true
+			},
+			want: "subject versioning does not allow message TTLs",
+		},
+		{
+			name: "mirror",
+			mutate: func(cfg *StreamConfig) {
+				cfg.Mirror = &StreamSource{Name: "ORIGIN"}
+			},
+			want: "subject versioning does not support mirrors",
+		},
+		{
+			name: "bad-transform",
+			mutate: func(cfg *StreamConfig) {
+				cfg.SubjectVersioning.SubjectTransform = &SubjectTransformConfig{
+					Source:      "events.*.*.*",
+					Destination: "events.$1.$9",
+				}
+			},
+			want: "subject versioning transform destination is invalid",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testSubjectVersioningStreamConfig("SV_"+tc.name, MemoryStorage)
+			tc.mutate(&cfg)
+			_, err := s.GlobalAccount().addStream(&cfg)
+			require_Error(t, err)
+			require_Contains(t, err.Error(), tc.want)
+		})
+	}
+}
+
+func TestJetStreamSubjectVersioningUpdateRequiresEmptyStream(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	mset, err := s.GlobalAccount().addStream(&StreamConfig{
+		Name:     "SV_UPDATE",
+		Storage:  MemoryStorage,
+		Subjects: []string{"events.order.*.*"},
+	})
+	require_NoError(t, err)
+
+	_, _, err = mset.store.StoreMsg("events.order.123.created", nil, []byte("one"), 0)
+	require_NoError(t, err)
+
+	cfg := mset.cfg.clone()
+	cfg.DenyDelete = true
+	cfg.DenyPurge = true
+	cfg.SubjectVersioning = &SubjectVersioningConfig{
+		Mode: SubjectVersioningModeGapless,
+		SubjectTransform: &SubjectTransformConfig{
+			Source:      "events.order.*.*",
+			Destination: "events.order.$1",
+		},
+	}
+	err = mset.update(cfg)
+	require_Error(t, err)
+	require_Contains(t, err.Error(), "subject versioning can only be changed on an empty stream")
+}
+
+func TestMemStoreSubjectVersionStateTracksCanonicalHeaders(t *testing.T) {
+	cfg := testSubjectVersioningStreamConfig("SV_MEM", MemoryStorage)
+	ms, err := newMemStore(&cfg)
+	require_NoError(t, err)
+	defer ms.Stop()
+
+	hdr := genHeader(nil, JSSubjectVersion, "0")
+	hdr = genHeader(hdr, JSSubjectVersionKey, "events.order.123")
+	_, _, err = ms.StoreMsg("events.order.123.created", hdr, []byte("one"), 0)
+	require_NoError(t, err)
+
+	hdr = genHeader(nil, JSSubjectVersion, "1")
+	hdr = genHeader(hdr, JSSubjectVersionKey, "events.order.123")
+	_, _, err = ms.StoreMsg("events.order.123.cancelled", hdr, []byte("two"), 0)
+	require_NoError(t, err)
+
+	ms.mu.RLock()
+	sv, ok := ms.svs.Find([]byte("events.order.123"))
+	require_True(t, ok)
+	require_Equal(t, sv.lastVersion, uint64(1))
+	require_Equal(t, sv.lastSeq, uint64(2))
+	ms.mu.RUnlock()
+
+	require_NoError(t, ms.Truncate(1))
+
+	ms.mu.RLock()
+	sv, ok = ms.svs.Find([]byte("events.order.123"))
+	require_True(t, ok)
+	require_Equal(t, sv.lastVersion, uint64(0))
+	require_Equal(t, sv.lastSeq, uint64(1))
+	ms.mu.RUnlock()
+
+	require_NoError(t, ms.reset())
+	ms.mu.RLock()
+	require_Equal(t, ms.svs.Size(), 0)
+	ms.mu.RUnlock()
+}
+
+func TestFileStoreSubjectVersionStateRecoversFromCheckpoint(t *testing.T) {
+	cfg := testSubjectVersioningStreamConfig("SV_FILE", FileStorage)
+	dir := t.TempDir()
+
+	fs, err := newFileStore(FileStoreConfig{StoreDir: dir}, cfg)
+	require_NoError(t, err)
+
+	hdr := genHeader(nil, JSSubjectVersion, "0")
+	hdr = genHeader(hdr, JSSubjectVersionKey, "events.order.123")
+	_, _, err = fs.StoreMsg("events.order.123.created", hdr, []byte("one"), 0)
+	require_NoError(t, err)
+
+	hdr = genHeader(nil, JSSubjectVersion, "1")
+	hdr = genHeader(hdr, JSSubjectVersionKey, "events.order.123")
+	_, _, err = fs.StoreMsg("events.order.123.cancelled", hdr, []byte("two"), 0)
+	require_NoError(t, err)
+
+	require_NoError(t, fs.forceWriteFullState())
+	_, err = os.Stat(filepath.Join(dir, msgDir, subjectVersionStateFile))
+	require_NoError(t, err)
+	require_NoError(t, fs.Stop())
+
+	reopened, err := newFileStore(FileStoreConfig{StoreDir: dir}, cfg)
+	require_NoError(t, err)
+	defer reopened.Stop()
+
+	reopened.mu.RLock()
+	sv, ok := reopened.svs.Find([]byte("events.order.123"))
+	require_True(t, ok)
+	require_Equal(t, sv.lastVersion, uint64(1))
+	require_Equal(t, sv.lastSeq, uint64(2))
+	reopened.mu.RUnlock()
+}

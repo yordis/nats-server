@@ -1723,7 +1723,11 @@ func TestJetStreamAtomicBatchPublishStageAndCommit(t *testing.T) {
 				if m.rsubject != _EMPTY_ {
 					rsubject = m.rsubject
 				}
-				_, _, _, _, err = checkMsgHeadersPreClusteredProposal(diff, mset, m.subject, rsubject, hdr, m.msg, false, "TEST", nil, test.allowRollup, test.denyPurge, test.allowTTL, test.allowMsgCounter, test.allowMsgSchedules, discard, discardNewPer, -1, maxMsgs, maxMsgsPer, maxBytes)
+				subjectVersionKey := _EMPTY_
+				if mset.cfg.subjectVersioningEnabled() {
+					subjectVersionKey = mset.subjectVersionKey(m.subject)
+				}
+				_, _, _, _, err = checkMsgHeadersPreClusteredProposal(diff, mset, m.subject, rsubject, subjectVersionKey, false, hdr, m.msg, false, "TEST", nil, test.allowRollup, test.denyPurge, test.allowTTL, test.allowMsgCounter, test.allowMsgSchedules, discard, discardNewPer, -1, maxMsgs, maxMsgsPer, maxBytes)
 				if m.err != nil {
 					require_Error(t, err, m.err)
 				} else if err != nil {
@@ -1779,7 +1783,7 @@ func TestJetStreamCounterStagingDoesNotCorruptCommittedTotal(t *testing.T) {
 	msg := []byte(`{"val":"5"}`)
 	diff := &batchStagedDiff{}
 	mset.clMu.Lock()
-	_, _, _, _, err = checkMsgHeadersPreClusteredProposal(diff, mset, "foo", "foo", hdr, msg, true, "TEST", nil, false, false, false, true, false, DiscardOld, false, -1, -1, -1, -1)
+	_, _, _, _, err = checkMsgHeadersPreClusteredProposal(diff, mset, "foo", "foo", _EMPTY_, false, hdr, msg, true, "TEST", nil, false, false, false, true, false, DiscardOld, false, -1, -1, -1, -1)
 	mset.clMu.Unlock()
 	require_NoError(t, err)
 

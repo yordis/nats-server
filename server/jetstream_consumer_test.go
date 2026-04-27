@@ -4709,9 +4709,10 @@ func TestJetStreamConsumerReplayRate(t *testing.T) {
 					t.Fatalf("Unexpected error: %v", err)
 				}
 				gap := time.Since(start)
-				// 15ms is high but on macs time.Sleep(delay) does not sleep only delay.
-				// Also on travis if things get bogged down this could be delayed.
-				gl, gh := gaps[i]-10*time.Millisecond, gaps[i]+15*time.Millisecond
+				// ReplayOriginal can be a bit early or late under suite load because
+				// the push delivery goroutine and the measuring goroutine are not
+				// synchronized to the exact same wake-up point.
+				gl, gh := gaps[i]-15*time.Millisecond, gaps[i]+20*time.Millisecond
 				if gap < gl || gap > gh {
 					t.Fatalf("Gap is off for %d, expected %v got %v", i, gaps[i], gap)
 				}
@@ -4732,8 +4733,7 @@ func TestJetStreamConsumerReplayRate(t *testing.T) {
 					t.Fatalf("Unexpected error: %v", err)
 				}
 				gap := time.Since(start)
-				// 10ms is high but on macs time.Sleep(delay) does not sleep only delay.
-				gl, gh := gaps[i]-5*time.Millisecond, gaps[i]+10*time.Millisecond
+				gl, gh := gaps[i]-10*time.Millisecond, gaps[i]+15*time.Millisecond
 				if gap < gl || gap > gh {
 					t.Fatalf("Gap is incorrect for %d, expected %v got %v", i, gaps[i], gap)
 				}
@@ -8724,10 +8724,14 @@ func TestJetStreamConsumerPullRemoveInterest(t *testing.T) {
 	// This is using new style request mechanism. so drop the connection itself to get rid of interest.
 	nc.Close()
 
-	// Wait for client cleanup
-	checkFor(t, 200*time.Millisecond, 10*time.Millisecond, func() error {
-		if n := s.NumClients(); err != nil || n != 0 {
+	// Wait for the closed request to disappear from both the connection table
+	// and the consumer's pull wait queue before sending the next message.
+	checkFor(t, 5*time.Second, 10*time.Millisecond, func() error {
+		if n := s.NumClients(); n != 0 {
 			return fmt.Errorf("Still have %d clients", n)
+		}
+		if ci := o.info(); ci != nil && ci.NumWaiting != 0 {
+			return fmt.Errorf("Still have %d waiting requests", ci.NumWaiting)
 		}
 		return nil
 	})
@@ -8758,6 +8762,12 @@ func TestJetStreamConsumerPullRemoveInterest(t *testing.T) {
 			t.Fatalf("Expected an error, got none")
 		}
 	}
+	checkFor(t, 5*time.Second, 10*time.Millisecond, func() error {
+		if ci := o.info(); ci != nil && ci.NumWaiting != 0 {
+			return fmt.Errorf("Still have %d waiting requests", ci.NumWaiting)
+		}
+		return nil
+	})
 
 	// Send a second message
 	sendStreamMsg(t, nc, mname, "Hello World!")

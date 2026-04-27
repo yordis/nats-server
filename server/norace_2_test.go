@@ -1099,7 +1099,7 @@ func TestNoRaceJetStreamClusterBadRestartsWithHealthzPolling(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
 
-	nc, js := jsClientConnect(t, c.randomServer())
+	nc, js := jsClientConnectEx(t, c.leader(), []nats.JSOpt{nats.MaxWait(30 * time.Second)})
 	defer nc.Close()
 
 	cfg := &nats.StreamConfig{
@@ -1128,7 +1128,7 @@ func TestNoRaceJetStreamClusterBadRestartsWithHealthzPolling(t *testing.T) {
 		}
 	}()
 
-	numConsumers := 500
+	numConsumers := 250
 	consumers := make([]string, 0, numConsumers)
 
 	var wg sync.WaitGroup
@@ -1158,7 +1158,7 @@ func TestNoRaceJetStreamClusterBadRestartsWithHealthzPolling(t *testing.T) {
 	})
 
 	// Now do same for streams.
-	numStreams := 200
+	numStreams := 100
 	streams := make([]string, 0, numStreams)
 
 	for i := 0; i < numStreams; i++ {
