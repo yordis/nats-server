@@ -16,6 +16,8 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -68,6 +70,104 @@ func TestJetStreamClusterSubjectVersioningReplicatedPublish(t *testing.T) {
 	}
 }
 
+func TestJetStreamClusterSubjectVersioningConcurrentPublish(t *testing.T) {
+	c := createSubjectVersioningCluster(t, "SVCONCURRENT", 3)
+	defer c.shutdown()
+
+	nc, _ := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	cfg := testSubjectVersioningStreamConfig("SV_CLUSTER_CONCURRENT", FileStorage)
+	cfg.Replicas = 3
+	_, err := jsStreamCreate(t, nc, &cfg)
+	require_NoError(t, err)
+
+	type publishResult struct {
+		key     string
+		version uint64
+		err     error
+	}
+
+	publish := func(subject string, results chan<- publishResult) {
+		msg := nats.NewMsg(subject)
+		ack, err := requestSubjectVersioningPubAckResponse(nc, msg)
+		if err != nil {
+			results <- publishResult{err: err}
+			return
+		}
+		if ack.SubjectVersion == nil {
+			results <- publishResult{err: fmt.Errorf("missing subject version for %s", subject)}
+			return
+		}
+		results <- publishResult{
+			key:     ack.SubjectVersionKey,
+			version: *ack.SubjectVersion,
+		}
+	}
+
+	checkContiguous := func(results []publishResult, key string, want int) {
+		t.Helper()
+
+		versions := make([]uint64, 0, want)
+		for _, result := range results {
+			if result.key == key {
+				versions = append(versions, result.version)
+			}
+		}
+		require_Len(t, len(versions), want)
+		sort.Slice(versions, func(i, j int) bool {
+			return versions[i] < versions[j]
+		})
+		for i, version := range versions {
+			require_Equal(t, version, uint64(i))
+		}
+	}
+
+	const sameNamespacePublishes = 32
+	results := make(chan publishResult, sameNamespacePublishes)
+	var wg sync.WaitGroup
+	for i := range sameNamespacePublishes {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			publish(fmt.Sprintf("events.order.123.step%d", i), results)
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+
+	sameNamespaceResults := make([]publishResult, 0, sameNamespacePublishes)
+	for result := range results {
+		require_NoError(t, result.err)
+		sameNamespaceResults = append(sameNamespaceResults, result)
+	}
+	checkContiguous(sameNamespaceResults, "events.order.123", sameNamespacePublishes)
+
+	const publishesPerNamespace = 16
+	results = make(chan publishResult, publishesPerNamespace*2)
+	for i := range publishesPerNamespace {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			publish(fmt.Sprintf("events.order.456.step%d", i), results)
+		}(i)
+		go func(i int) {
+			defer wg.Done()
+			publish(fmt.Sprintf("events.invoice.900.step%d", i), results)
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+
+	multipleNamespaceResults := make([]publishResult, 0, publishesPerNamespace*2)
+	for result := range results {
+		require_NoError(t, result.err)
+		multipleNamespaceResults = append(multipleNamespaceResults, result)
+	}
+	checkContiguous(multipleNamespaceResults, "events.order.456", publishesPerNamespace)
+	checkContiguous(multipleNamespaceResults, "events.invoice.900", publishesPerNamespace)
+}
+
 func TestJetStreamClusterAtomicBatchSubjectVersioningExpectedVersionFirstOnly(t *testing.T) {
 	c := createSubjectVersioningCluster(t, "SVBATCH", 3)
 	defer c.shutdown()
@@ -105,6 +205,13 @@ func TestJetStreamClusterAtomicBatchSubjectVersioningExpectedVersionFirstOnly(t 
 	require_NoError(t, json.Unmarshal(respMsg.Data, &pubAck))
 	require_NotNil(t, pubAck.Error)
 	require_Error(t, pubAck.Error, NewJSStreamWrongLastSubjectVersionConstantError())
+
+	next := nats.NewMsg("events.order.123.updated")
+	next.Header.Set(JSExpectedLastSubjectVer, "0")
+	nextAck := requestSubjectVersioningPubAck(t, nc, next)
+	require_NotNil(t, nextAck.SubjectVersion)
+	require_Equal(t, *nextAck.SubjectVersion, uint64(1))
+	require_Equal(t, nextAck.SubjectVersionKey, "events.order.123")
 }
 
 func TestJetStreamClusterSubjectVersioningSurvivesLeaderChange(t *testing.T) {

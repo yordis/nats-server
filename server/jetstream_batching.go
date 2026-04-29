@@ -645,6 +645,7 @@ func checkMsgHeadersPreClusteredProposal(
 				err := fmt.Errorf("last subject version mismatch: %d vs %s", expected.version, subjectVersionLabel(found, current.lastVersion))
 				return hdr, msg, 0, NewJSStreamWrongLastSubjectVersionError(subjectVersionLabel(found, current.lastVersion)), err
 			}
+			hdr = removeHeaderIfPresent(hdr, JSExpectedLastSubjectVer)
 		}
 		// TTL'd messages are rejected entirely if TTLs are not enabled on the stream, or if the TTL is invalid.
 		if ttl, err := getMessageTTL(hdr); !sourced && (ttl != 0 || err != nil) {

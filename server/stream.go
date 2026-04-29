@@ -6698,6 +6698,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 					}
 					return apiErr
 				}
+				hdr = removeHeaderIfPresent(hdr, JSExpectedLastSubjectVer)
 			}
 
 			// TTL'd messages are rejected entirely if TTLs are not enabled on the stream.
