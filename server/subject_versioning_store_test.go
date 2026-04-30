@@ -16,6 +16,7 @@
 package server
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -44,6 +45,77 @@ func testSubjectVersioningStreamConfig(name string, storage StorageType) StreamC
 	}
 }
 
+func BenchmarkSubjectVersioningHighCardinalityStore(b *testing.B) {
+	for _, storage := range []StorageType{MemoryStorage, FileStorage} {
+		b.Run(storage.String(), func(b *testing.B) {
+			cfg := testSubjectVersioningStreamConfig("SV_BENCH_"+storage.String(), storage)
+			var store StreamStore
+			switch storage {
+			case MemoryStorage:
+				ms, err := newMemStore(&cfg)
+				require_NoError(b, err)
+				store = ms
+			case FileStorage:
+				fs, err := newFileStore(FileStoreConfig{StoreDir: b.TempDir()}, cfg)
+				require_NoError(b, err)
+				store = fs
+			}
+			b.Cleanup(func() {
+				require_NoError(b, store.Stop())
+			})
+
+			payload := []byte("payload")
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				key := fmt.Sprintf("events.order.%d", i)
+				hdr := genHeader(nil, JSSubjectVersion, "0")
+				hdr = genHeader(hdr, JSSubjectVersionKey, key)
+				_, _, err := store.StoreMsg(key+".created", hdr, payload, 0)
+				require_NoError(b, err)
+			}
+			b.StopTimer()
+
+			switch store := store.(type) {
+			case *memStore:
+				store.mu.RLock()
+				require_Equal(b, store.svs.Size(), b.N)
+				store.mu.RUnlock()
+			case *fileStore:
+				store.mu.RLock()
+				require_Equal(b, store.svs.Size(), b.N)
+				store.mu.RUnlock()
+			}
+		})
+	}
+}
+
+func BenchmarkFileStoreSubjectVersionStateCheckpoint(b *testing.B) {
+	const namespaces = 10_000
+
+	cfg := testSubjectVersioningStreamConfig("SV_BENCH_CHECKPOINT", FileStorage)
+	fs, err := newFileStore(FileStoreConfig{StoreDir: b.TempDir()}, cfg)
+	require_NoError(b, err)
+	b.Cleanup(func() {
+		require_NoError(b, fs.Stop())
+	})
+
+	payload := []byte("payload")
+	for i := 0; i < namespaces; i++ {
+		key := fmt.Sprintf("events.order.%d", i)
+		hdr := genHeader(nil, JSSubjectVersion, "0")
+		hdr = genHeader(hdr, JSSubjectVersionKey, key)
+		_, _, err := fs.StoreMsg(key+".created", hdr, payload, 0)
+		require_NoError(b, err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		require_NoError(b, fs.writeSubjectVersionState())
+	}
+}
+
 func TestJetStreamSubjectVersioningConfigValidation(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
@@ -68,11 +140,32 @@ func TestJetStreamSubjectVersioningConfigValidation(t *testing.T) {
 			want: "subject versioning does not allow message TTLs",
 		},
 		{
+			name: "message-schedules",
+			mutate: func(cfg *StreamConfig) {
+				cfg.AllowMsgSchedules = true
+			},
+			want: "subject versioning requires deny purge",
+		},
+		{
 			name: "mirror",
 			mutate: func(cfg *StreamConfig) {
 				cfg.Mirror = &StreamSource{Name: "ORIGIN"}
 			},
 			want: "subject versioning does not support mirrors",
+		},
+		{
+			name: "source",
+			mutate: func(cfg *StreamConfig) {
+				cfg.Sources = []*StreamSource{{Name: "ORIGIN"}}
+			},
+			want: "subject versioning does not support sources",
+		},
+		{
+			name: "republish",
+			mutate: func(cfg *StreamConfig) {
+				cfg.RePublish = &RePublish{Destination: "copy.>"}
+			},
+			want: "subject versioning does not support republish",
 		},
 		{
 			name: "bad-transform",

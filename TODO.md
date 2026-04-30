@@ -16,25 +16,25 @@ Default path: keep the current write-path stream feature for now, but make it ge
   - [x] grouped namespace
   - [x] concurrent replicated publishes
   - [x] failover/catchup continuity
-- [ ] Third, add a small cost/scale measurement.
+- [x] Third, add a small cost/scale measurement.
 - [x] Fourth, run focused tests.
-- [ ] Fifth, run the full `./server` package.
+- [ ] Fifth, get a clean full `./server` package run.
 - [ ] Last, request maintainer review on the smallest defensible scope.
 
 ## File Map
 
-- [ ] Public API/config: `server/stream.go`
-- [ ] PubAck and header constants: `server/stream.go`
-- [ ] Generated API errors: `server/errors.json`, `server/jetstream_errors_generated.go`
-- [ ] Non-clustered publish path: `server/stream.go`
-- [ ] Clustered publish path: `server/jetstream_cluster.go`
-- [ ] Fast and atomic batch handling: `server/jetstream_batching.go`, `server/stream.go`
-- [ ] In-memory state: `server/memstore.go`
-- [ ] File-backed state and checkpointing: `server/filestore.go`
-- [ ] Publish/store tests: `server/subject_versioning_publish_test.go`, `server/subject_versioning_store_test.go`
-- [ ] Cluster/failover tests: `server/subject_versioning_cluster_test.go`
-- [ ] Batch tests: `server/subject_versioning_batch_test.go`
-- [ ] Shared test helpers: `server/subject_versioning_test_helpers_test.go`
+- Public API/config: `server/stream.go`
+- PubAck and header constants: `server/stream.go`
+- Generated API errors: `server/errors.json`, `server/jetstream_errors_generated.go`
+- Non-clustered publish path: `server/stream.go`
+- Clustered publish path: `server/jetstream_cluster.go`
+- Fast and atomic batch handling: `server/jetstream_batching.go`, `server/stream.go`
+- In-memory state: `server/memstore.go`
+- File-backed state and checkpointing: `server/filestore.go`
+- Publish/store tests: `server/subject_versioning_publish_test.go`, `server/subject_versioning_store_test.go`
+- Cluster/failover tests: `server/subject_versioning_cluster_test.go`
+- Batch tests: `server/subject_versioning_batch_test.go`
+- Shared test helpers: `server/subject_versioning_test_helpers_test.go`
 
 ## Decision Gates
 
@@ -50,9 +50,9 @@ Default path: keep the current write-path stream feature for now, but make it ge
 
 ## Phase 1: Reframe the Proposal
 
-- [ ] Rename the feature framing away from "event sourcing subject versioning".
-- [ ] Pick a neutral public concept name such as "subject namespace sequence" or "stream-assigned subject sequence".
-- [ ] Treat event sourcing as one motivating use case, not the feature identity.
+- [x] Rename the feature framing away from "event sourcing subject versioning".
+- [x] Pick a neutral public concept name such as "subject namespace sequence" or "stream-assigned subject sequence".
+- [x] Treat event sourcing as one motivating use case, not the feature identity.
 - [x] Rewrite the PR summary around a generic JetStream capability:
   - [x] opt-in behavior
   - [x] explicit namespace derivation
@@ -86,20 +86,20 @@ Default path: keep the current write-path stream feature for now, but make it ge
 
 ## Phase 3: Reduce the Storage-Mutation Objection
 
-- [ ] Decide whether canonical headers remain stored metadata or become consumption-time decoration.
-- [ ] If stored headers remain:
+- [x] Decide whether canonical headers remain stored metadata or become consumption-time decoration.
+- [x] If stored headers remain:
   - [x] Explain why payloads are never mutated.
   - [x] Explain why server-owned metadata headers are acceptable.
   - [x] Keep rejecting client-supplied `Nats-Subject-Version`.
   - [x] Keep rejecting client-supplied `Nats-Subject-Version-Key`.
   - [x] Explain why stored metadata is needed for replay, direct get, and duplicate PubAck correctness.
   - [x] Verify expected-version command headers are not stored as canonical event metadata.
-  - [ ] Verify sourced/mirrored/scheduled messages remain rejected or explicitly out of scope.
-- [ ] If maintainers reject stored headers:
-  - [ ] Pivot to consumption-time decoration.
-  - [ ] Remove header injection from the store path.
-  - [ ] Move version assignment into consumer/group delivery behavior.
-  - [ ] Rework tests around decorated delivery metadata instead of stored message metadata.
+  - [x] Verify sourced/mirrored/scheduled messages remain rejected or explicitly out of scope.
+- Fallback plan if maintainers reject stored headers:
+  - Pivot to consumption-time decoration.
+  - Remove header injection from the store path.
+  - Move version assignment into consumer/group delivery behavior.
+  - Rework tests around decorated delivery metadata instead of stored message metadata.
 
 ## Phase 4: Separate Publish Sequencing From Consumer Recovery
 
@@ -131,11 +131,11 @@ Default path: keep the current write-path stream feature for now, but make it ge
 - [x] Compare the cost shape honestly to `NumPending`-style per-subject/per-filter tracking.
 - [x] Call out memory growth for high-cardinality namespaces.
 - [x] Call out filestore checkpoint growth for high-cardinality namespaces.
-- [ ] Add a small benchmark or measurement for many namespace keys.
+- [x] Add a small benchmark or measurement for many namespace keys.
 - [x] Confirm checkpoint write cadence is not per-message.
 - [x] Confirm restart recovery is checkpoint-plus-catchup, not full scan on every normal restart.
 - [x] Include the cost trade-off as a reason for the feature being opt-in.
-- [ ] Decide whether v1 needs a guardrail such as max tracked namespaces.
+- [x] Decide whether v1 needs a guardrail such as max tracked namespaces.
 
 ## Phase 7: Clean Up PR Contents
 
@@ -144,7 +144,7 @@ Default path: keep the current write-path stream feature for now, but make it ge
 - [x] Decide whether `adr/ADR-gapless-per-subject-event-versioning.md` belongs in this repo or should move to the architecture repo.
 - [x] If keeping an ADR draft in this repo temporarily, make it concise and maintainer-facing.
 - [ ] Make naming consistent across code, tests, docs, and errors.
-- [ ] Check generated errors are stable and do not collide with upstream error IDs.
+- [x] Check generated errors are stable and do not collide with upstream error IDs.
 - [ ] Keep `TODO.md` out of the final PR unless the maintainers explicitly want it.
 - [ ] Make sure all committed documentation uses the project voice, not first-person notes.
 
@@ -162,6 +162,12 @@ mise exec -- go test ./server -run 'TestJetStreamSubjectVersioning(ExactSubjectN
 mise exec -- go test ./server -run 'TestJetStreamClusterExpectedPerSubjectConsistency|TestJetStreamAtomicBatchPublishExpectedPerSubject|TestJetStreamFastBatchPublishDuplicates|TestJetStreamFastBatchPublishDuplicatesCluster|TestJetStreamFastBatchSequentialDuplicateAndErrorPubAck|TestJetStreamClusterSubjectTransformWithExpectedSubjectSequenceHeader|TestJetStreamInterestStreamWithDuplicateMessages|TestJetStreamUpdateStream|TestStoreSubjectStateConsistency' -count=1
 ```
 
+- [x] Run the high-cardinality cost benchmark:
+
+```sh
+mise exec -- go test ./server -run '^$' -bench 'BenchmarkSubjectVersioningHighCardinalityStore|BenchmarkFileStoreSubjectVersionStateCheckpoint' -benchtime=10x -count=1
+```
+
 - [x] Run the focused subject-sequence test set:
 
 ```sh
@@ -174,13 +180,17 @@ mise exec -- go test ./server -run 'SubjectVersioning|ExpectedPerSubjectConsiste
 mise exec -- go test ./server -run 'SubjectVersioning|TestJetStreamAtomicBatchPublishExpectedPerSubject|TestJetStreamFastBatchPublishDuplicates|TestJetStreamFastBatchPublishDuplicatesCluster|TestJetStreamFastBatchSequentialDuplicateAndErrorPubAck|TestJetStreamClusterSubjectTransformWithExpectedSubjectSequenceHeader|TestJetStreamInterestStreamWithDuplicateMessages|TestJetStreamUpdateStream|TestStoreSubjectStateConsistency' -count=1
 ```
 
-- [ ] Run the full server package before requesting final review:
+- [ ] Get a clean full server package run before requesting final review:
 
 ```sh
 mise exec -- go test ./server -count=1 -timeout=30m
 ```
 
-- [ ] Plain `mise exec -- go test ./server -count=1` is not sufficient on this machine; it hit Go's default 10 minute package timeout in unrelated filestore/dirstore tests.
+- Attempted with `env GOCACHE=/Volumes/Otter/Cache/go-build-cache mise exec -- go test ./server -count=1 -timeout=30m`.
+  - Failed in unrelated broad-suite coverage: `TestGatewayOCSPMissingPeerStapleIssue` returned an OCSP `404 Not Found`.
+  - The package then hit the 30 minute timeout while `TestJetStreamClusterInterestPolicyEphemeral/InterestWithName` was still running.
+
+- Note: plain `mise exec -- go test ./server -count=1` is not sufficient on this machine; it hit Go's default 10 minute package timeout in unrelated filestore/dirstore tests.
 
 - [x] Run formatting/checks required by the repo.
 - [x] Run `git diff --check`.
@@ -196,9 +206,9 @@ mise exec -- go test ./server -count=1 -timeout=30m
 - [x] Explain cost and high-cardinality trade-offs.
 - [x] Avoid a "Test plan" section.
 - [x] Keep the PR description focused on why, not what/how.
-- [ ] Mention the branch started as a spike, but the PR scope is intentionally narrowed.
-- [ ] Link ADR-60 when explaining consumer recovery.
-- [ ] Ask for an explicit maintainer decision on Gate A if it remains uncertain.
+- [x] Mention the branch started as a spike, but the PR scope is intentionally narrowed.
+- [x] Link ADR-60 when explaining consumer recovery.
+- [x] Ask for an explicit maintainer decision on Gate A if it remains uncertain.
 
 ## Open Design Questions To Resolve With Maintainers
 
