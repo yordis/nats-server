@@ -40,6 +40,16 @@ The proposed v1 configuration shape is:
 }
 ```
 
+The nested `subject_transform` is not the stream's top-level subject transform and does not rewrite where the message is stored. It only derives the namespace key used for sequencing from the final stored subject.
+
+With the example above:
+
+| Stored subject | Derived namespace key | Assigned namespace sequence |
+| --- | --- | --- |
+| `events.order.123.created` | `events.order.123` | `0` |
+| `events.order.123.cancelled` | `events.order.123` | `1` |
+| `events.invoice.900.issued` | `events.invoice.900` | `0` |
+
 The proposed public name is still open. The branch currently uses `subject_versioning`, `Nats-Subject-Version`, and `Nats-Expected-Last-Subject-Version`, but a rename toward `subject_sequence` or subject namespace sequencing should happen only after maintainer preference is clear because it affects config, headers, generated errors, and tests.
 
 ## Namespace Derivation
@@ -49,7 +59,7 @@ Namespace derivation is explicit and based on the final stored subject:
 1. Accept the publish subject.
 2. Apply any stream-level input subject transform.
 3. Store the message under the final stored subject.
-4. If `subject_versioning.subject_transform` is configured, derive the namespace key from the stored subject.
+4. If `subject_versioning.subject_transform` is configured, derive the namespace key from the stored subject without changing the stored subject.
 5. Otherwise, use the stored subject as the namespace key.
 
 This supports exact-subject sequencing and grouped namespace sequencing without coupling the write contract to consumers.
