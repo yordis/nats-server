@@ -9780,6 +9780,10 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64) (purged uint
 		if sequence > 1 {
 			return fs.compact(sequence)
 		}
+		// Make sure to not leave subject if empty.
+		if subject == _EMPTY_ {
+			subject = fwcs
+		}
 	}
 
 	// Persist any write errors.
@@ -9790,11 +9794,6 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64) (purged uint
 			fs.mu.Unlock()
 		}
 	}()
-
-	// Make sure to not leave subject if empty and we reach this spot.
-	if subject == _EMPTY_ {
-		subject = fwcs
-	}
 
 	eq, wc := compareFn(subject), subjectHasWildcard(subject)
 	var firstSeqNeedsUpdate bool
