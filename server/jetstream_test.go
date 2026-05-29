@@ -20949,6 +20949,16 @@ func TestJetStreamAllowMsgCounterIncompatibleSettings(t *testing.T) {
 	})
 	require_Error(t, err, NewJSStreamInvalidConfigError(fmt.Errorf("counter stream cannot use message TTLs")))
 
+	// AllowMsgSchedules not allowed.
+	_, err = jsStreamCreate(t, nc, &StreamConfig{
+		Name:              "TEST",
+		Subjects:          []string{"foo"},
+		Storage:           FileStorage,
+		AllowMsgCounter:   true,
+		AllowMsgSchedules: true,
+	})
+	require_Error(t, err, NewJSStreamInvalidConfigError(fmt.Errorf("counter stream cannot use message schedules")))
+
 	// Only limits retention is allowed.
 	for _, retention := range []RetentionPolicy{InterestPolicy, WorkQueuePolicy} {
 		_, err = jsStreamCreate(t, nc, &StreamConfig{
@@ -22441,6 +22451,37 @@ func TestJetStreamScheduledMessageNotTriggering(t *testing.T) {
 			})
 		})
 	}
+}
+
+func TestJetStreamScheduledMessageIncompatibleSettings(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+
+	// DiscardNew not allowed.
+	_, err := jsStreamCreate(t, nc, &StreamConfig{
+		Name:              "TEST",
+		Subjects:          []string{"foo"},
+		Storage:           FileStorage,
+		AllowMsgSchedules: true,
+		Discard:           DiscardNew,
+	})
+	require_Error(t, err, NewJSStreamInvalidConfigError(fmt.Errorf("message scheduling cannot use discard new")))
+
+	// AllowRollup required.
+	_, err = addStreamPedanticWithError(t, nc, &StreamConfigRequest{
+		StreamConfig: StreamConfig{
+			Name:              "TEST",
+			Subjects:          []string{"foo"},
+			Storage:           FileStorage,
+			AllowMsgSchedules: true,
+			AllowRollup:       false,
+		},
+		Pedantic: true,
+	})
+	require_Error(t, err, NewJSStreamInvalidConfigError(fmt.Errorf("message scheduling cannot be set if roll-ups are disabled")))
 }
 
 func TestJetStreamScheduledPurgeHeadersRequiresSchedulingEnabled(t *testing.T) {
