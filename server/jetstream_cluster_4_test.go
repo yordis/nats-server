@@ -4239,6 +4239,80 @@ func TestJetStreamClusterKeepRaftStateIfStreamCreationFailedDuringShutdown(t *te
 	require_True(t, len(files) > 0)
 }
 
+func TestJetStreamClusterKeepRaftStateIfStreamUpdateFailed(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Storage:  nats.FileStorage,
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	for range 10 {
+		_, err = js.Publish("foo", []byte("hello"))
+		require_NoError(t, err)
+	}
+
+	// Operate on a follower that is a member of the group.
+	rs := c.randomNonStreamLeader(globalAccountName, "TEST")
+	acc, err := rs.lookupAccount(globalAccountName)
+	require_NoError(t, err)
+	mset, err := acc.lookupStream("TEST")
+	require_NoError(t, err)
+	node := mset.raftNode()
+	require_NotNil(t, node)
+	rn := node.(*raft)
+	sd := rn.sd
+	jss := rs.getJetStream()
+
+	// RAFT state exists before we apply the bad update.
+	files, err := os.ReadDir(sd)
+	require_NoError(t, err)
+	require_True(t, len(files) > 0)
+
+	// Craft a committed assignment that reuses the SAME raft group (so the node
+	// gets resolved to the existing running node) but carries an invalid config
+	// change (storage type) that updateWithAdvisory will reject. This simulates
+	// an assignment that reaches a member without going through the API check.
+	osa := mset.streamAssignment()
+	require_NotNil(t, osa)
+	sa := osa.copyGroup()
+	sa.Group.node = nil
+	ncfg := *osa.Config
+	ncfg.Storage = MemoryStorage
+	sa.Config = &ncfg
+
+	jss.processClusterCreateStream(acc, sa)
+
+	// The raft node must be stopped, NOT deleted: no data loss. Its on-disk
+	// state (WAL + store dir) must be preserved so it can recover later.
+	require_False(t, rn.IsDeleted())
+	require_Equal(t, rn.State(), Closed)
+	files, err = os.ReadDir(sd)
+	require_NoError(t, err)
+	require_True(t, len(files) > 0)
+
+	// The stream must be stopped on this server rather than left running with a
+	// config the rest of the cluster no longer agrees on.
+	require_True(t, mset.closed.Load())
+	_, err = acc.lookupStream("TEST")
+	require_Error(t, err)
+
+	// The stream remains available cluster-wide via the other peers, and its
+	// data is intact.
+	_, err = js.Publish("foo", []byte("after"))
+	require_NoError(t, err)
+	si, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+	require_Equal(t, si.State.Msgs, 11)
+}
+
 func TestJetStreamClusterMetaSnapshotReCreateConsistency(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()

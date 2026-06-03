@@ -5366,20 +5366,23 @@ func (js *jetStream) processClusterCreateStream(acc *Account, sa *streamAssignme
 			cfg := mset.config()
 			if !reflect.DeepEqual(&cfg, sa.Config) {
 				if err = mset.updateWithAdvisory(sa.Config, false, false); err != nil {
+					if js.isShuttingDown() {
+						s.Debugf("Could not update stream, JetStream shutting down")
+						return
+					}
 					s.Warnf("JetStream cluster error updating stream %q for account %q: %v", sa.Config.Name, acc.Name, err)
-					if osa != nil {
-						// Process the raft group and make sure it's running if needed.
-						js.createRaftGroup(acc.GetName(), osa.Group, osa.recovering, storage, pprofLabels{
-							"type":    "stream",
-							"account": mset.accName(),
-							"stream":  mset.name(),
-						})
-						mset.setStreamAssignment(osa)
+					js.mu.Lock()
+					sa.err = err
+					// Detach the node from the assignment; we stop (not delete) it below,
+					// and it unregisters itself once its goroutines exit.
+					if sa.Group != nil {
+						sa.Group.node = nil
 					}
-					if rg.node != nil {
-						rg.node.Delete()
-						rg.node = nil
-					}
+					js.mu.Unlock()
+					// Stop the monitor and raft node without deleting any state.
+					mset.stopMonitoring()
+					mset.stop(false, false)
+					return
 				}
 			}
 		} else if err == NewJSStreamNotFoundError() {
