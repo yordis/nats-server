@@ -3578,6 +3578,8 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 			if newPeerSet[ourPeerId] {
 				// First need to check on any consumers and make sure they have moved properly before scaling down ourselves.
 				js.mu.RLock()
+				// Need to read meta under the js lock, it's set to nil on shutdown.
+				meta := cc.meta
 				var needToWait bool
 				for name, c := range sa.consumers {
 					if c.unsupported != nil {
@@ -3599,6 +3601,10 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 				if needToWait {
 					continue
 				}
+				if meta == nil {
+					// We are shutting down.
+					continue
+				}
 				// We are good to go, can scale down here.
 				n.ProposeKnownPeers(newPeers)
 
@@ -3606,7 +3612,7 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 				csa.Group.Peers = newPeers
 				csa.Group.Preferred = ourPeerId
 				csa.Group.Cluster = s.cachedClusterName()
-				cc.meta.ForwardProposal(encodeUpdateStreamAssignment(csa))
+				meta.ForwardProposal(encodeUpdateStreamAssignment(csa))
 				s.Noticef("Scaling down '%s > %s' to %+v", accName, sa.Config.Name, s.peerSetToNames(newPeers))
 			} else {
 				// We are the old leader here, from the original peer set.
@@ -3692,6 +3698,14 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 			// Check to see if we have restored consumers here.
 			// These are not currently assigned so we will need to do so here.
 			if consumers := mset.getPublicConsumers(); len(consumers) > 0 {
+				// Need to read meta under the js lock, it's set to nil on shutdown.
+				js.mu.RLock()
+				meta := cc.meta
+				js.mu.RUnlock()
+				if meta == nil {
+					// We are shutting down.
+					continue
+				}
 				for _, o := range consumers {
 					name, cfg := o.String(), o.config()
 					rg := cc.createGroupForConsumer(&cfg, sa)
@@ -3712,7 +3726,7 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 
 					// We make these compressed in case state is complex.
 					addEntry := encodeAddConsumerAssignmentCompressed(ca)
-					cc.meta.ForwardProposal(addEntry)
+					meta.ForwardProposal(addEntry)
 
 					// Check to make sure we see the assignment.
 					go func() {
@@ -5466,9 +5480,15 @@ func (js *jetStream) processClusterCreateStream(acc *Account, sa *streamAssignme
 					// Check to see if we have restored consumers here.
 					// These are not currently assigned so we will need to do so here.
 					if consumers := mset.getPublicConsumers(); len(consumers) > 0 {
+						// Need to read meta under the js lock, it's set to nil on shutdown.
 						js.mu.RLock()
 						cc := js.cluster
+						meta := cc.meta
 						js.mu.RUnlock()
+						if meta == nil {
+							// We are shutting down.
+							return
+						}
 
 						for _, o := range consumers {
 							name, cfg := o.String(), o.config()
@@ -5485,7 +5505,7 @@ func (js *jetStream) processClusterCreateStream(acc *Account, sa *streamAssignme
 							}
 
 							addEntry := encodeAddConsumerAssignment(ca)
-							cc.meta.ForwardProposal(addEntry)
+							meta.ForwardProposal(addEntry)
 
 							// Check to make sure we see the assignment.
 							go func() {
