@@ -8197,6 +8197,10 @@ func TestJetStreamClusterStreamUpdateMaxConsumersLimit(t *testing.T) {
 				c.restartAll()
 				c.waitOnLeader()
 				c.waitOnStreamLeader(globalAccountName, "TEST")
+				c.waitOnConsumerLeader(globalAccountName, "TEST", "CONSUMER_1")
+				if !remove {
+					c.waitOnConsumerLeader(globalAccountName, "TEST", "CONSUMER_2")
+				}
 			}
 		}
 
