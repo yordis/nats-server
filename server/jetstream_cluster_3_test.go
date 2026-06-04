@@ -6886,6 +6886,38 @@ func TestJetStreamClusterProcessSnapshotPanicAfterStreamDelete(t *testing.T) {
 	require_Error(t, mset.processSnapshot(&StreamReplicatedState{}, 0), errCatchupStreamStopped)
 }
 
+func TestJetStreamClusterProcessSnapshotWhenLimitsExceeded(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	sl := c.streamLeader(globalAccountName, "TEST")
+	mset, err := sl.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+
+	// Force this server to believe it has exceeded its storage limits.
+	sjs := sl.getJetStream()
+	atomic.StoreInt64(&sjs.storeMax, -1)
+	require_True(t, sjs.limitsExceeded(FileStorage))
+
+	// The snapshot should bail with insufficient resources. As otherwise
+	// the snapshot would be incorrectly marked successful.
+	snap := StreamReplicatedState{FirstSeq: 1, LastSeq: 100}
+	err = mset.processSnapshot(&snap, 100)
+	require_Error(t, err, NewJSInsufficientResourcesError())
+	require_False(t, isClusterResetErr(err))
+	require_False(t, isOutOfSpaceErr(err))
+}
+
 func TestJetStreamClusterDiscardNewPerSubjectRejectsWithoutCLFSBump(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
