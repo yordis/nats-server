@@ -11177,7 +11177,9 @@ func TestFileStoreEraseMsgDoesNotLoseTombstonesInEmptyBlock(t *testing.T) {
 		require_Error(t, err, ErrStoreMsgNotFound)
 
 		// The message should be erased.
+		mb.mu.Lock()
 		buf, err := mb.loadBlock(nil)
+		mb.mu.Unlock()
 		require_NoError(t, err)
 		require_False(t, bytes.Contains(buf, secret))
 
