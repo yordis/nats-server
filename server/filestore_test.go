@@ -10935,6 +10935,40 @@ func TestFileStoreMessageScheduleEncodeDecode(t *testing.T) {
 	}
 }
 
+func TestFileStoreMessageScheduleDecodeRejectsMalformed(t *testing.T) {
+	// Build a valid header that claims a single schedule entry.
+	header := func(count uint64) []byte {
+		b := make([]byte, headerLen)
+		b[0] = 1                                    // Magic version
+		binary.LittleEndian.PutUint64(b[1:], count) // Entry count
+		binary.LittleEndian.PutUint64(b[9:], 0)     // High sequence stamp
+		return b
+	}
+
+	for _, test := range []struct {
+		title string
+		buf   []byte
+		err   error
+	}{
+		{title: "ShortHeader", buf: make([]byte, headerLen-1), err: io.ErrShortBuffer},
+		{title: "BadVersion", buf: func() []byte { b := header(0); b[0] = 2; return b }(), err: ErrMsgScheduleInvalidVersion},
+		// Claims one entry but the buffer ends right after the header.
+		{title: "TruncatedAtSubjLen", buf: header(1), err: io.ErrUnexpectedEOF},
+		// Claims one entry, has the subject length but the subject bytes are missing.
+		{title: "TruncatedSubj", buf: append(header(1), 5, 0), err: io.ErrUnexpectedEOF},
+		// Has the subject but the timestamp/seq varints are missing.
+		{title: "TruncatedVarints", buf: append(header(1), 3, 0, 'f', 'o', 'o'), err: io.ErrUnexpectedEOF},
+		// Has the subject and timestamp varint but the seq varint is missing.
+		{title: "TruncatedSeq", buf: append(append(header(1), 3, 0, 'f', 'o', 'o'), binary.AppendVarint(nil, 12345)...), err: io.ErrUnexpectedEOF},
+	} {
+		t.Run(test.title, func(t *testing.T) {
+			ms := newMsgScheduling(func() {})
+			_, err := ms.decode(test.buf)
+			require_Error(t, err, test.err)
+		})
+	}
+}
+
 func TestFileStoreCorruptedNonOrderedSequences(t *testing.T) {
 	for _, test := range []struct {
 		title   string
