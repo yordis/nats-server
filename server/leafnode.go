@@ -738,6 +738,10 @@ func connectToRemoteLeafNode(s *Server, remote *leafNodeCfg, firstConnect bool) 
 		defer remote.cancelMigrateTimer()
 	}
 
+	reconnectTimer := time.NewTimer(reconnectDelay)
+	reconnectTimer.Stop()
+	defer stopAndClearTimer(&reconnectTimer)
+
 	for s.isRunning() && remote.stillValid() {
 		rURL := remote.pickNextURL()
 		url, err := s.getRandomIP(resolver, rURL.Host, nil)
@@ -789,12 +793,13 @@ func connectToRemoteLeafNode(s *Server, remote *leafNodeCfg, firstConnect bool) 
 				})
 			}
 			remote.Unlock()
+			reconnectTimer.Reset(delay)
 			select {
 			case <-s.quitCh:
 				return false
 			case <-remote.quitCh:
 				return false
-			case <-time.After(delay):
+			case <-reconnectTimer.C:
 				// Check if we should migrate any JetStream assets immediately while this remote is down.
 				// This will be used if JetStreamClusterMigrateDelay was not set
 				if jetstreamMigrateDelay == 0 {
