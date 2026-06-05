@@ -16,46 +16,6 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/release/') }}
 
 jobs:
-  signoffs:
-    name: Sign-offs
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    permissions:
-      contents: read
-      pull-requests: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Check all PR commits are signed off
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-
-          range="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
-
-          missing=0
-          missing_list=""
-
-          for c in $(git rev-list --no-merges $range); do
-            msg="$(git log -1 --pretty=%B "$c")"
-            if ! printf '%s\n' "$msg" | grep -q '^Signed-off-by:'; then
-              echo "::error ::Commit $c has not been signed off"
-              git log -1 --pretty=format:"%h %s" "$c"
-              missing=1
-              missing_list+=$'\n- '"$(git log -1 --pretty=format:'%H `%s`' "$c")"''
-            fi
-          done
-
-          if [ "$missing" -ne 0 ]; then
-            gh pr comment ${{ github.event.pull_request.number }} \
-              --body "$(printf "Please review the \`CONTRIBUTING.md\` guide as some commits are missing \`Signed-off-by:\` in their commit messages.\n\nTo correct, please amend the following commits and force-push:\n\n%s" "$missing_list")"
-            exit 1
-          fi
-
   lint:
     name: Lint
     runs-on: ubuntu-latest
