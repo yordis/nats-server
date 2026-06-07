@@ -1052,6 +1052,24 @@ func (c *client) RegisterNkeyUser(user *NkeyUser) error {
 	return nil
 }
 
+func (c *client) updateDefaultPermissions(perms *Permissions) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.user == nil || !c.user.defaultPerms {
+		return false
+	}
+	if perms == nil {
+		c.user.Permissions = nil
+		c.perms = nil
+		c.mperms = nil
+		c.darray = nil
+		return true
+	}
+	c.user.Permissions = perms.clone()
+	c.setPermissions(c.user.Permissions)
+	return true
+}
+
 func splitSubjectQueue(sq string) ([]byte, []byte, error) {
 	vals := strings.Fields(strings.TrimSpace(sq))
 	s := []byte(vals[0])

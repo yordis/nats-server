@@ -69,6 +69,7 @@ type NkeyUser struct {
 	SigningKey             string              `json:"signing_key,omitempty"`
 	AllowedConnectionTypes map[string]struct{} `json:"connection_types,omitempty"`
 	ProxyRequired          bool                `json:"proxy_required,omitempty"`
+	defaultPerms           bool
 }
 
 // User is for multiple accounts/users.

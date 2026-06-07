@@ -3390,7 +3390,13 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 
 	a.mu.Lock()
 	// Clone to update, only select certain fields.
-	old := &Account{Name: a.Name, exports: a.exports, limits: a.limits, signingKeys: a.signingKeys}
+	old := &Account{
+		Name:         a.Name,
+		exports:      a.exports,
+		limits:       a.limits,
+		signingKeys:  a.signingKeys,
+		defaultPerms: a.defaultPerms.clone(),
+	}
 
 	// overwrite claim meta data
 	a.nameTag = ac.Name
@@ -3792,6 +3798,8 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 		a.jsLimits = nil
 	}
 
+	defaultPerms := a.defaultPerms
+	defaultPermsChanged := !reflect.DeepEqual(old.defaultPerms, defaultPerms)
 	a.updated = time.Now()
 	clients := a.getClientsLocked()
 	ajs := a.js
@@ -3870,6 +3878,9 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 		}
 		theJWT := c.opts.JWT
 		c.mu.Unlock()
+		if defaultPermsChanged && c.updateDefaultPermissions(defaultPerms) && defaultPerms != nil {
+			c.processSubsOnConfigReload(nil)
+		}
 		// Check for being revoked here. We use ac one to avoid the account lock.
 		if (ac.Revocations != nil || ac.Limits.DisallowBearer) && theJWT != _EMPTY_ {
 			if juc, err := jwt.DecodeUserClaims(theJWT); err != nil {
@@ -4027,8 +4038,11 @@ func buildInternalNkeyUser(uc *jwt.UserClaims, acts map[string]struct{}, acc *Ac
 
 	// Now check for permissions.
 	var p = buildPermissionsFromJwt(&uc.Permissions)
-	if p == nil && acc.defaultPerms != nil {
-		p = acc.defaultPerms.clone()
+	if p == nil {
+		nu.defaultPerms = true
+		if acc.defaultPerms != nil {
+			p = acc.defaultPerms.clone()
+		}
 	}
 	nu.Permissions = p
 	return nu
