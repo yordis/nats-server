@@ -364,6 +364,103 @@ func TestJWTUserPermissionClaims(t *testing.T) {
 	}
 }
 
+func TestJWTAccountDefaultPermissionsUpdateRefreshesClients(t *testing.T) {
+	nac := newJWTTestAccountClaims()
+	nac.DefaultPermissions.Pub.Allow.Add("foo")
+	nac.DefaultPermissions.Sub.Allow.Add("foo")
+
+	s, _, c, cr := setupJWTTestWitAccountClaims(t, nac, "+OK")
+	defer s.Shutdown()
+	defer c.close()
+
+	if l, _ := cr.ReadString('\n'); !strings.HasPrefix(l, "PONG") {
+		t.Fatalf("Expected PONG, got %q", l)
+	}
+
+	c.mu.Lock()
+	acc := c.acc
+	require_True(t, c.pubAllowedFullCheck("foo", true, true))
+	require_True(t, c.canSubscribe("foo"))
+	c.mu.Unlock()
+	require_NotNil(t, acc)
+
+	c.parseAsync("SUB foo 1\r\nPING\r\n")
+	if l, _ := cr.ReadString('\n'); !strings.HasPrefix(l, "+OK") {
+		t.Fatalf("Expected subscription to be accepted, got %q", l)
+	}
+	if l, _ := cr.ReadString('\n'); !strings.HasPrefix(l, "PONG") {
+		t.Fatalf("Expected PONG, got %q", l)
+	}
+
+	nac = jwt.NewAccountClaims(acc.Name)
+	nac.DefaultPermissions.Pub.Allow.Add("bar")
+	nac.DefaultPermissions.Sub.Allow.Add("bar")
+	ajwt, err := nac.Encode(oKp)
+	require_NoError(t, err)
+
+	addAccountToMemResolver(s, acc.Name, ajwt)
+	s.UpdateAccountClaims(acc, nac)
+
+	c.mu.Lock()
+	require_False(t, c.pubAllowedFullCheck("foo", true, true))
+	require_True(t, c.pubAllowedFullCheck("bar", true, true))
+	require_False(t, c.canSubscribe("foo"))
+	require_True(t, c.canSubscribe("bar"))
+	_, ok := c.subs["1"]
+	c.mu.Unlock()
+	require_False(t, ok)
+
+	line, _ := cr.ReadString('\n')
+	require_Contains(t, line, `Permissions Violation for Subscription to "foo"`)
+
+	c.parseAsync("PUB foo 0\r\n\r\n")
+	line, _ = cr.ReadString('\n')
+	require_Contains(t, line, `Permissions Violation for Publish to "foo"`)
+}
+
+func TestJWTAccountDefaultPermissionsUpdateKeepsExplicitUserPermissions(t *testing.T) {
+	nac := newJWTTestAccountClaims()
+	nac.DefaultPermissions.Pub.Allow.Add("foo")
+	nac.DefaultPermissions.Sub.Allow.Add("foo")
+
+	nuc := newJWTTestUserClaims()
+	nuc.Permissions.Pub.Allow.Add("baz")
+	nuc.Permissions.Sub.Allow.Add("baz")
+
+	s, _, c, cr := setupJWTTestWithClaims(t, nac, nuc, "+OK")
+	defer s.Shutdown()
+	defer c.close()
+
+	if l, _ := cr.ReadString('\n'); !strings.HasPrefix(l, "PONG") {
+		t.Fatalf("Expected PONG, got %q", l)
+	}
+
+	c.mu.Lock()
+	acc := c.acc
+	require_True(t, c.pubAllowedFullCheck("baz", true, true))
+	require_False(t, c.pubAllowedFullCheck("foo", true, true))
+	require_True(t, c.canSubscribe("baz"))
+	require_False(t, c.canSubscribe("foo"))
+	c.mu.Unlock()
+	require_NotNil(t, acc)
+
+	nac = jwt.NewAccountClaims(acc.Name)
+	nac.DefaultPermissions.Pub.Allow.Add("bar")
+	nac.DefaultPermissions.Sub.Allow.Add("bar")
+	ajwt, err := nac.Encode(oKp)
+	require_NoError(t, err)
+
+	addAccountToMemResolver(s, acc.Name, ajwt)
+	s.UpdateAccountClaims(acc, nac)
+
+	c.mu.Lock()
+	require_True(t, c.pubAllowedFullCheck("baz", true, true))
+	require_False(t, c.pubAllowedFullCheck("bar", true, true))
+	require_True(t, c.canSubscribe("baz"))
+	require_False(t, c.canSubscribe("bar"))
+	c.mu.Unlock()
+}
+
 func TestJWTUserResponsePermissionClaims(t *testing.T) {
 	nuc := newJWTTestUserClaims()
 	nuc.Permissions.Resp = &jwt.ResponsePermission{
