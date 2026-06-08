@@ -840,6 +840,7 @@ func (js *jetStream) isConsumerHealthy(mset *stream, consumer string, ca *consum
 	if node != nil {
 		nrgWerr = node.GetWriteErr()
 	}
+	consumerWerr := o.getWriteErr()
 	switch {
 	case rc <= 1:
 		return nil // No further checks for R=1 consumers
@@ -860,6 +861,9 @@ func (js *jetStream) isConsumerHealthy(mset *stream, consumer string, ca *consum
 
 	case nrgWerr != nil:
 		return fmt.Errorf("node write error: %v", nrgWerr)
+
+	case consumerWerr != nil:
+		return fmt.Errorf("consumer write error: %v", consumerWerr)
 
 	case !o.isMonitorRunning():
 		return errors.New("monitor goroutine not running")
@@ -6462,6 +6466,44 @@ func (o *consumer) streamAndNode() (*stream, RaftNode) {
 	return o.mset, o.node
 }
 
+// setWriteErr stores the write error in the consumer.
+func (o *consumer) setWriteErr(err error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.setWriteErrLocked(err)
+}
+
+func (o *consumer) setWriteErrLocked(err error) {
+	if o.werr != nil {
+		return
+	}
+	// Ignore non-write errors.
+	if err == ErrStoreClosed {
+		return
+	}
+	o.srv.Errorf("JetStream consumer '%s > %s > %s' critical write error: %v", o.acc.Name, o.stream, o.name, err)
+	o.werr = err
+	assert.Unreachable("Consumer encountered write error", map[string]any{
+		"account":  o.acc.Name,
+		"stream":   o.stream,
+		"consumer": o.name,
+		"err":      err,
+	})
+
+	// If consumer is replicated, put it in observer mode to make sure another server can pick it up.
+	if node := o.node; node != nil {
+		node.StepDown()
+		node.SetObserver(true)
+	}
+}
+
+// getWriteErr returns the write error stored in the consumer (if any).
+func (o *consumer) getWriteErr() error {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.werr
+}
+
 // Return the replica count for this consumer. If the consumer has been
 // stopped, this will return an error.
 func (o *consumer) replica() (int, error) {
@@ -6641,7 +6683,12 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 						doSnapshot(false)
 					}
 				} else if err != errConsumerClosed {
-					s.Warnf("Error applying consumer entries to '%s > %s'", ca.Client.serviceAccount(), ca.Name)
+					s.Errorf("Error applying consumer entries to '%s > %s': %v", ca.Client.serviceAccount(), ca.Name, err)
+					// Encountered an unexpected error, can't continue.
+					o.setWriteErr(err)
+					ce.ReturnToPool()
+					aq.recycle(&ces)
+					return
 				}
 				ce.ReturnToPool()
 			}
@@ -6806,7 +6853,7 @@ func (js *jetStream) applyConsumerEntries(o *consumer, ce *CommittedEntry, isLea
 						s.Errorf("JetStream cluster could not decode consumer snapshot for '%s > %s > %s' [%s]",
 							mset.account(), mset.name(), o, node.Group())
 					}
-					panic(err.Error())
+					return err
 				}
 
 				if err = o.store.Update(state); err != nil && err != ErrStoreOldUpdate {
@@ -6861,7 +6908,7 @@ func (js *jetStream) applyConsumerEntries(o *consumer, ce *CommittedEntry, isLea
 						s.Errorf("JetStream cluster could not decode consumer delivered update for '%s > %s > %s' [%s]",
 							mset.account(), mset.name(), o, node.Group())
 					}
-					panic(err.Error())
+					return err
 				}
 				// Make sure to update delivered under the lock.
 				o.mu.Lock()
@@ -6886,7 +6933,7 @@ func (js *jetStream) applyConsumerEntries(o *consumer, ce *CommittedEntry, isLea
 				}
 				o.mu.Unlock()
 				if err != nil {
-					panic(err.Error())
+					return err
 				}
 			case updateAcksOp:
 				dseq, sseq, err := decodeAckUpdate(buf[1:])
@@ -6896,7 +6943,7 @@ func (js *jetStream) applyConsumerEntries(o *consumer, ce *CommittedEntry, isLea
 						s.Errorf("JetStream cluster could not decode consumer ack update for '%s > %s > %s' [%s]",
 							mset.account(), mset.name(), o, node.Group())
 					}
-					panic(err.Error())
+					return err
 				}
 				if err := o.processReplicatedAck(dseq, sseq); err == errConsumerClosed {
 					return err
@@ -6977,7 +7024,7 @@ func (js *jetStream) applyConsumerEntries(o *consumer, ce *CommittedEntry, isLea
 				}
 				o.mu.Unlock()
 			default:
-				panic(fmt.Sprintf("JetStream Cluster Unknown group entry op type: %v", entryOp(buf[0])))
+				return fmt.Errorf("unknown consumer entry op type: %v", entryOp(buf[0]))
 			}
 		}
 	}

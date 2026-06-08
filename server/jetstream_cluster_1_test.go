@@ -12587,6 +12587,60 @@ func TestJetStreamClusterMalformedEntrySetsWriteErr(t *testing.T) {
 	require_True(t, sl.Running())
 }
 
+func TestJetStreamClusterMalformedConsumerEntrySetsWriteErr(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:   "CONS",
+		AckPolicy: nats.AckExplicitPolicy,
+		Replicas:  3,
+	})
+	require_NoError(t, err)
+
+	// Confirm the consumer is healthy and has no write error to begin with.
+	cl := c.consumerLeader(globalAccountName, "TEST", "CONS")
+	mset, err := cl.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	o := mset.lookupConsumer("CONS")
+	require_True(t, o != nil)
+	require_NoError(t, o.getWriteErr())
+
+	cjs := cl.getJetStream()
+	ca := o.consumerAssignment()
+	require_NoError(t, cjs.isConsumerHealthy(mset, "CONS", ca))
+
+	// Craft a malformed consumer entry using an unknown op, this must surface as a consumer write error.
+	bad := []byte{255, 1, 2, 3}
+	n := o.raftNode().(*raft)
+	n.sendAppendEntry([]*Entry{newEntry(EntryNormal, bad)})
+
+	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		werr := o.getWriteErr()
+		if werr == nil {
+			return fmt.Errorf("consumer write error not set yet")
+		}
+		// Healthz must now reflect the broken state.
+		if err := cjs.isConsumerHealthy(mset, "CONS", ca); err == nil {
+			return fmt.Errorf("consumer still reported healthy")
+		}
+		return nil
+	})
+
+	// Sanity: the server must still be running (no panic took it down).
+	require_True(t, cl.Running())
+}
+
 //
 // DO NOT ADD NEW TESTS IN THIS FILE (unless to balance test times)
 // Add at the end of jetstream_cluster_<n>_test.go, with <n> being the highest value.
