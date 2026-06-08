@@ -836,6 +836,10 @@ func (js *jetStream) isConsumerHealthy(mset *stream, consumer string, ca *consum
 
 	oNode := o.raftNode()
 	rc, _ := o.replica()
+	var nrgWerr error
+	if node != nil {
+		nrgWerr = node.GetWriteErr()
+	}
 	switch {
 	case rc <= 1:
 		return nil // No further checks for R=1 consumers
@@ -853,6 +857,9 @@ func (js *jetStream) isConsumerHealthy(mset *stream, consumer string, ca *consum
 		mset.mu.RUnlock()
 		s.Warnf("Detected consumer cluster node skew '%s > %s > %s'", accName, streamName, consumer)
 		return errors.New("cluster node skew detected")
+
+	case nrgWerr != nil:
+		return fmt.Errorf("node write error: %v", nrgWerr)
 
 	case !o.isMonitorRunning():
 		return errors.New("monitor goroutine not running")
