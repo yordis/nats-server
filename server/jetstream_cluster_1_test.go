@@ -12546,6 +12546,47 @@ func TestJetStreamClusterStreamPeerRemovePeerSetDesync(t *testing.T) {
 	})
 }
 
+func TestJetStreamClusterMalformedEntrySetsWriteErr(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	// Confirm the stream is healthy and has no write error to begin with.
+	_, err = js.Publish("foo", []byte("ok"))
+	require_NoError(t, err)
+
+	sl := c.streamLeader(globalAccountName, "TEST")
+	mset, err := sl.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	require_NoError(t, mset.getWriteErr())
+
+	// Craft a malformed streamMsgOp, this must surface as a stream write error.
+	bad := append([]byte{byte(streamMsgOp)}, 1, 2, 3)
+	n := mset.raftNode().(*raft)
+	n.sendAppendEntry([]*Entry{newEntry(EntryNormal, bad)})
+
+	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		werr := mset.getWriteErr()
+		if werr == nil {
+			return fmt.Errorf("stream write error not set yet")
+		}
+		require_Error(t, werr, errBadStreamMsg)
+		return nil
+	})
+
+	// Sanity: the server must still be running (no panic took it down).
+	require_True(t, sl.Running())
+}
+
 //
 // DO NOT ADD NEW TESTS IN THIS FILE (unless to balance test times)
 // Add at the end of jetstream_cluster_<n>_test.go, with <n> being the highest value.

@@ -3409,7 +3409,7 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 						aq.recycle(&ces)
 						return
 					}
-					s.Errorf("Error applying entries to '%s > %s': %v", accName, sa.Config.Name, err)
+					s.Errorf("Error applying stream entries to '%s > %s': %v", accName, sa.Config.Name, err)
 					if isClusterResetErr(err) {
 						if mset.isMirror() && mset.IsLeader() {
 							mset.retryMirrorConsumer()
@@ -3937,7 +3937,7 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 			if op == batchMsgOp {
 				batchId, batchSeq, _, _, err := decodeBatchMsg(buf[1:])
 				if err != nil {
-					panic(err.Error())
+					return 0, err
 				}
 				// Initialize if unset.
 				if batch == nil {
@@ -3977,7 +3977,7 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 							batch.mu.Unlock()
 							mset.mu.Unlock()
 							if err != nil {
-								panic(err.Error())
+								return 0, err
 							}
 							continue
 						}
@@ -3997,7 +3997,7 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 			} else if op == batchCommitMsgOp {
 				batchId, batchSeq, _, _, err := decodeBatchMsg(buf[1:])
 				if err != nil {
-					panic(err.Error())
+					return 0, err
 				}
 
 				// Ensure the whole batch is fully isolated, and reads
@@ -4033,7 +4033,7 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 						batch.mu.Unlock()
 						mset.mu.Unlock()
 						if err != nil {
-							panic(err.Error())
+							return 0, err
 						}
 						continue
 					}
@@ -4058,22 +4058,24 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 						// Otherwise, all entries are used.
 						entries = bce.Entries
 					}
+					clearAndUnlock := func() {
+						// Make sure to return remaining entries to the pool on an error.
+						for _, nce := range batch.entries[j:] {
+							nce.ReturnToPool()
+						}
+						// Important to clear, otherwise we could return the entries to the pool multiple times.
+						batch.clearBatchStateLocked()
+						batch.mu.Unlock()
+						mset.mu.Unlock()
+					}
 					for _, entry := range entries {
 						_, _, op, buf, err = decodeBatchMsg(entry.Data[1:])
 						if err != nil {
-							batch.mu.Unlock()
-							mset.mu.Unlock()
-							panic(err.Error())
+							clearAndUnlock()
+							return 0, err
 						}
 						if err = js.applyStreamMsgOp(mset, op, buf, isRecovering, false); err != nil {
-							// Make sure to return remaining entries to the pool on an error.
-							for _, nce := range batch.entries[j:] {
-								nce.ReturnToPool()
-							}
-							// Important to clear, otherwise we could return the entries to the pool multiple times.
-							batch.clearBatchStateLocked()
-							batch.mu.Unlock()
-							mset.mu.Unlock()
+							clearAndUnlock()
 							return 0, err
 						}
 					}
@@ -4087,19 +4089,21 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 					// Get all entries up to and including the current one.
 					entries = ce.Entries[:i+1]
 				}
+				clearAndUnlock := func() {
+					// Important to clear, otherwise we could return the entries to the pool multiple times.
+					batch.clearBatchStateLocked()
+					batch.mu.Unlock()
+					mset.mu.Unlock()
+				}
 				// Process remaining entries in the current entry.
 				for _, entry := range entries {
 					_, _, op, buf, err = decodeBatchMsg(entry.Data[1:])
 					if err != nil {
-						batch.mu.Unlock()
-						mset.mu.Unlock()
-						panic(err.Error())
+						clearAndUnlock()
+						return 0, err
 					}
 					if err = js.applyStreamMsgOp(mset, op, buf, isRecovering, false); err != nil {
-						// Important to clear, otherwise we could return the entries to the pool multiple times.
-						batch.clearBatchStateLocked()
-						batch.mu.Unlock()
-						mset.mu.Unlock()
+						clearAndUnlock()
 						return 0, err
 					}
 				}
@@ -4128,7 +4132,7 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 						s.Errorf("JetStream cluster could not decode delete range for '%s > %s' [%s]",
 							mset.account(), mset.name(), node.Group())
 					}
-					panic(err.Error())
+					return 0, err
 				}
 				if dr.Num == 0 {
 					continue
@@ -4163,7 +4167,7 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 						s.Errorf("JetStream cluster could not decode delete msg for '%s > %s' [%s]",
 							mset.account(), mset.name(), node.Group())
 					}
-					panic(err.Error())
+					return 0, err
 				}
 				s := js.server()
 
@@ -4214,7 +4218,7 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 						s.Errorf("JetStream cluster could not decode purge msg for '%s > %s' [%s]",
 							mset.account(), mset.name(), node.Group())
 					}
-					panic(err.Error())
+					return 0, err
 				}
 				// If no explicit request, fill in with leader stamped last sequence to protect ourselves on replay during server start.
 				if sp.Request == nil || sp.Request.Sequence == 0 {
@@ -4250,7 +4254,7 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 					}
 				}
 			default:
-				panic(fmt.Sprintf("JetStream Cluster Unknown group entry op type: %v", op))
+				return 0, fmt.Errorf("unknown stream entry op type: %v", op)
 			}
 		} else if e.Type == EntrySnapshot {
 			// Everything operates on new replicated state. Will convert legacy snapshots to this for processing.
@@ -4378,22 +4382,24 @@ func (js *jetStream) applyStreamMsgOp(mset *stream, op entryOp, mbuf []byte, isR
 		var err error
 		mbuf, err = s2.Decode(nil, mbuf)
 		if err != nil {
-			panic(err.Error())
+			return err
 		}
 	}
 
 	subject, reply, hdr, msg, lseq, ts, sourced, err := decodeStreamMsg(mbuf)
 	if err != nil {
-		// We're going to panic below, but if we're already holding the stream lock, we should let go now.
-		// Otherwise we'll deadlock when trying to get the raft node.
-		if !needLock {
-			mset.mu.Unlock()
+		if needLock {
+			mset.mu.RLock()
 		}
-		if node := mset.raftNode(); node != nil {
+		acc, name, node := mset.accountLocked(false), mset.nameLocked(false), mset.node
+		if needLock {
+			mset.mu.RUnlock()
+		}
+		if node != nil {
 			s.Errorf("JetStream cluster could not decode stream msg for '%s > %s' [%s]",
-				mset.account(), mset.name(), node.Group())
+				acc, name, node.Group())
 		}
-		panic(err.Error())
+		return err
 	}
 
 	// Check for flowcontrol here.
@@ -10742,7 +10748,7 @@ func (mset *stream) processCatchupMsg(msg []byte) (uint64, error) {
 		var err error
 		mbuf, err = s2.Decode(nil, mbuf)
 		if err != nil {
-			panic(err.Error())
+			return 0, errCatchupBadMsg
 		}
 	}
 
