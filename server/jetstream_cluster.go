@@ -84,6 +84,8 @@ type jetStreamCluster struct {
 	// Track last meta snapshot time and duration for monitoring.
 	lastMetaSnapTime     int64 // Unix nanoseconds
 	lastMetaSnapDuration int64 // Duration in nanoseconds
+	// If a write error was encountered while applying meta entries, and if so what error.
+	werr error
 }
 
 // Used to track inflight stream create/update/delete requests that have been proposed but not yet applied.
@@ -1454,6 +1456,45 @@ func (js *jetStream) isMetaRecovering() bool {
 	return js.metaRecovering
 }
 
+// setMetaWriteErr stores the write error on the meta group.
+func (js *jetStream) setMetaWriteErr(err error) {
+	js.mu.Lock()
+	defer js.mu.Unlock()
+	js.setMetaWriteErrLocked(err)
+}
+
+func (js *jetStream) setMetaWriteErrLocked(err error) {
+	cc := js.cluster
+	if cc == nil || cc.werr != nil {
+		return
+	}
+	// Ignore non-write errors.
+	if err == ErrStoreClosed {
+		return
+	}
+	js.srv.Errorf("JetStream cluster meta group critical write error: %v", err)
+	cc.werr = err
+	assert.Unreachable("Meta group encountered write error", map[string]any{
+		"err": err,
+	})
+
+	// Step down and put into observer mode so another server can pick up the meta leadership.
+	if node := cc.meta; node != nil {
+		node.StepDown()
+		node.SetObserver(true)
+	}
+}
+
+// getMetaWriteErr returns the write error stored on the meta group (if any).
+func (js *jetStream) getMetaWriteErr() error {
+	js.mu.RLock()
+	defer js.mu.RUnlock()
+	if js.cluster == nil {
+		return nil
+	}
+	return js.cluster.werr
+}
+
 // During recovery track any stream and consumer delete and update operations.
 type recoveryUpdates struct {
 	removeStreams   map[string]*streamAssignment
@@ -1906,7 +1947,12 @@ func (js *jetStream) monitorCluster() {
 					}
 					recovering = isRecovering
 				} else {
-					s.Warnf("Error applying JetStream cluster entries: %v", err)
+					s.Errorf("Error applying JetStream cluster entries: %v", err)
+					// Encountered an unexpected error, can't continue.
+					js.setMetaWriteErr(err)
+					ce.ReturnToPool()
+					aq.recycle(&ces)
+					return
 				}
 				ce.ReturnToPool()
 			}
@@ -2294,7 +2340,7 @@ func (js *jetStream) collectStreamAndConsumerChanges(c RaftNodeCheckpoint, strea
 					sa, err := decodeStreamAssignment(js.srv, buf[1:])
 					if err != nil {
 						js.srv.Errorf("JetStream cluster failed to decode stream assignment: %q", buf[1:])
-						panic(err)
+						return err
 					}
 					if op == removeStreamOp {
 						ru.removeStream(sa)
@@ -2305,25 +2351,25 @@ func (js *jetStream) collectStreamAndConsumerChanges(c RaftNodeCheckpoint, strea
 					ca, err := decodeConsumerAssignment(buf[1:])
 					if err != nil {
 						js.srv.Errorf("JetStream cluster failed to decode consumer assignment: %q", buf[1:])
-						panic(err)
+						return err
 					}
 					ru.addOrUpdateConsumer(ca)
 				case assignCompressedConsumerOp:
 					ca, err := decodeConsumerAssignmentCompressed(buf[1:])
 					if err != nil {
 						js.srv.Errorf("JetStream cluster failed to decode compressed consumer assignment: %q", buf[1:])
-						panic(err)
+						return err
 					}
 					ru.addOrUpdateConsumer(ca)
 				case removeConsumerOp:
 					ca, err := decodeConsumerAssignment(buf[1:])
 					if err != nil {
 						js.srv.Errorf("JetStream cluster failed to decode consumer assignment: %q", buf[1:])
-						panic(err)
+						return err
 					}
 					ru.removeConsumer(ca)
 				default:
-					panic(fmt.Sprintf("JetStream Cluster Unknown meta entry op type: %v", entryOp(buf[0])))
+					return fmt.Errorf("unknown meta entry op type: %v", entryOp(buf[0]))
 				}
 			}
 		}
@@ -2747,7 +2793,7 @@ func (js *jetStream) applyMetaEntries(entries []*Entry, ru *recoveryUpdates) (bo
 					js.processUpdateStreamAssignment(sa)
 				}
 			default:
-				panic(fmt.Sprintf("JetStream Cluster Unknown meta entry op type: %v", entryOp(buf[0])))
+				return isRecovering, didSnap, fmt.Errorf("unknown meta entry op type: %v", entryOp(buf[0]))
 			}
 		}
 	}

@@ -12641,6 +12641,39 @@ func TestJetStreamClusterMalformedConsumerEntrySetsWriteErr(t *testing.T) {
 	require_True(t, cl.Running())
 }
 
+func TestJetStreamClusterMalformedMetaEntrySetsWriteErr(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	// Confirm the meta group is healthy and has no write error to begin with.
+	ml := c.leader()
+	require_True(t, ml != nil)
+	mjs := ml.getJetStream()
+	require_True(t, mjs != nil)
+	require_NoError(t, mjs.getMetaWriteErr())
+	require_Equal(t, ml.healthz(nil).Error, _EMPTY_)
+
+	// Craft a malformed meta entry using an unknown op, this must surface as a meta write error.
+	bad := []byte{255, 1, 2, 3}
+	n := mjs.getMetaGroup().(*raft)
+	n.sendAppendEntry([]*Entry{newEntry(EntryNormal, bad)})
+
+	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		werr := mjs.getMetaWriteErr()
+		if werr == nil {
+			return fmt.Errorf("meta write error not set yet")
+		}
+		// Healthz must now reflect the broken state.
+		if hs := ml.healthz(nil); hs.Error == _EMPTY_ {
+			return fmt.Errorf("meta group still reported healthy")
+		}
+		return nil
+	})
+
+	// Sanity: the server must still be running (no panic took it down).
+	require_True(t, ml.Running())
+}
+
 //
 // DO NOT ADD NEW TESTS IN THIS FILE (unless to balance test times)
 // Add at the end of jetstream_cluster_<n>_test.go, with <n> being the highest value.
