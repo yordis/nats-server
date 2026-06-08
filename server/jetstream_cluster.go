@@ -9892,6 +9892,9 @@ func decodeBatchMsg(buf []byte) (batchId string, batchSeq uint64, op entryOp, mb
 		return _EMPTY_, 0, 0, nil, errBadStreamMsg
 	}
 	buf = buf[n:]
+	if len(buf) < 1 {
+		return _EMPTY_, 0, 0, nil, errBadStreamMsg
+	}
 	op = entryOp(buf[0])
 	mbuf = buf[1:]
 	return batchId, batchSeq, op, mbuf, nil
