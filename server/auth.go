@@ -1099,7 +1099,7 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 				}
 			}
 			if len(deniedPub) > 0 || len(deniedSub) > 0 {
-				c.Noticef("Connected %s has JetStream denied on pub: %v sub: %v", c.kindString(), deniedPub, deniedSub)
+				c.Debugf("Connected %s has JetStream denied on pub: %v sub: %v", c.kindString(), deniedPub, deniedSub)
 			}
 		}
 
