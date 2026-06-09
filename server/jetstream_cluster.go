@@ -10771,6 +10771,14 @@ RETRY:
 					}
 					msgsQ.recycle(&mrecs)
 					return err
+				} else if err == errCatchupBadMsg {
+					// A bad/corrupt catchup message (e.g. a failed s2 decode) is a
+					// deterministic failure: requesting a fresh sync from the leader
+					// returns the same bytes, so retrying would churn indefinitely.
+					notifyLeaderStopCatchup(mrec, err)
+					s.Warnf("Catchup for stream '%s > %s' errored, bad message: %v", mset.account(), mset.name(), err)
+					msgsQ.recycle(&mrecs)
+					return err
 				} else {
 					notifyLeaderStopCatchup(mrec, err)
 					s.Warnf("Catchup for stream '%s > %s' errored, will retry: %v", mset.account(), mset.name(), err)

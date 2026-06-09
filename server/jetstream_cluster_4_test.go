@@ -8576,3 +8576,56 @@ func TestJetStreamClusterDecodeBatchMsgRejectsMalformed(t *testing.T) {
 		})
 	}
 }
+
+func TestJetStreamClusterCatchupBadMsgStopsRetrying(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		return checkState(t, c, globalAccountName, "TEST")
+	})
+
+	rs := c.randomNonStreamLeader(globalAccountName, "TEST")
+	mset, err := rs.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	sa := mset.streamAssignment()
+
+	// Make sure this server can't become the leader.
+	n := mset.raftNode().(*raft)
+	n.SetObserver(true)
+
+	sysNc, err := nats.Connect(rs.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer sysNc.Close()
+
+	sjs := rs.getJetStream()
+	sjs.mu.RLock()
+	syncSubj := sa.Sync
+	sjs.mu.RUnlock()
+
+	// Respond to the catchup with a corrupt compressed message.
+	var count atomic.Int32
+	sub, err := sysNc.Subscribe(syncSubj, func(msg *nats.Msg) {
+		count.Add(1)
+		// {0x80} is an incomplete varint and fails s2.Decode with corrupt input.
+		msg.Respond(append([]byte{byte(compressedStreamMsgOp)}, 0x80))
+	})
+	require_NoError(t, err)
+	defer sub.Drain()
+	require_NoError(t, sysNc.Flush()) // Must flush, otherwise our subscription could be too late.
+
+	err = mset.processSnapshot(&StreamReplicatedState{FirstSeq: 1, LastSeq: 1}, 1)
+	require_Error(t, err, errCatchupBadMsg)
+
+	// We must not have retried the catchup, a bad message bails out immediately.
+	require_Equal(t, count.Load(), 1)
+}
