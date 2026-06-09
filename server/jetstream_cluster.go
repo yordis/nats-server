@@ -8307,6 +8307,31 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 		return
 	}
 
+	// In the event that some of the stream-level limits have changed, yell appropriately
+	// if any of the consumers exceed that limit.
+	oldInactiveThreshold, newInactiveThreshold := osa.Config.ConsumerLimits.InactiveThreshold, newCfg.ConsumerLimits.InactiveThreshold
+	oldMaxAckPending, newMaxAckPending := osa.Config.ConsumerLimits.MaxAckPending, newCfg.ConsumerLimits.MaxAckPending
+	updateLimits := (newInactiveThreshold > 0 && oldInactiveThreshold != newInactiveThreshold) ||
+		(newMaxAckPending > 0 && oldMaxAckPending != newMaxAckPending)
+	if updateLimits {
+		var errorConsumers []string
+		for ca := range js.consumerAssignmentsOrInflightSeq(acc.Name, cfg.Name) {
+			if ca.Config == nil {
+				continue
+			}
+			if (newInactiveThreshold > 0 && ca.Config.InactiveThreshold > newInactiveThreshold) ||
+				(newMaxAckPending > 0 && ca.Config.MaxAckPending > newMaxAckPending) {
+				errorConsumers = append(errorConsumers, ca.Name)
+			}
+		}
+		if len(errorConsumers) > 0 {
+			err := fmt.Errorf("change to limits violates consumers: %s", strings.Join(errorConsumers, ", "))
+			resp.Error = NewJSStreamUpdateError(err)
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
+			return
+		}
+	}
+
 	// Make copy so to not change original.
 	rg := osa.copyGroup().Group
 
