@@ -10621,6 +10621,18 @@ func TestJetStreamClusterConsumerSelectStartingSeqDeferred(t *testing.T) {
 	})
 }
 
+type failProposeRaftNode struct {
+	RaftNode
+}
+
+func (n *failProposeRaftNode) Propose([]byte) error {
+	return errNotLeader
+}
+
+func (n *failProposeRaftNode) ProposeMulti([]*Entry) error {
+	return errNotLeader
+}
+
 func TestJetStreamClusterProposeFailureDoesNotDriftClseq(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
@@ -10649,16 +10661,23 @@ func TestJetStreamClusterProposeFailureDoesNotDriftClseq(t *testing.T) {
 	sl := c.streamLeader(globalAccountName, "TEST")
 	mset, err := sl.globalAccount().lookupStream("TEST")
 	require_NoError(t, err)
-	rn := mset.raftNode().(*raft)
 
-	// forceProposeFailure quickly switches the underlying Raft state, so any
-	// node.Propose / node.ProposeMulti call inside fn returns errNotLeader.
+	// forceProposeFailure changes node.Propose / node.ProposeMulti to always
+	// return errNotLeader.
 	// We deliberately do NOT touch n.leaderState, the upper layer still sees
 	// the node as leader, reproducing the race window.
 	forceProposeFailure := func(fn func() error) error {
-		prevState := rn.state.Swap(int32(Follower))
+		mset.mu.Lock()
+		prevNode := mset.node
+		mset.node = &failProposeRaftNode{RaftNode: prevNode}
+		mset.mu.Unlock()
+
 		err = fn()
-		rn.state.Store(prevState)
+
+		mset.mu.Lock()
+		mset.node = prevNode
+		mset.mu.Unlock()
+
 		return err
 	}
 
@@ -10708,9 +10727,7 @@ func TestJetStreamClusterProposeFailureDoesNotDriftClseq(t *testing.T) {
 	for _, s := range c.servers {
 		mset, err = s.globalAccount().lookupStream("TEST")
 		require_NoError(t, err)
-		rn = mset.raftNode().(*raft)
-		require_NotNil(t, rn)
-		require_False(t, rn.IsDeleted())
+		require_False(t, mset.raftNode().IsDeleted())
 	}
 }
 
