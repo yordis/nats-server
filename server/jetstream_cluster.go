@@ -10402,9 +10402,15 @@ func (mset *stream) processSnapshot(snap *StreamReplicatedState, index uint64) (
 		return errCatchupCorruptSnapshot
 	}
 
-	// Just return if up to date or already exceeded limits.
-	if sreq == nil || js.limitsExceeded(st) {
+	// Just return if up to date.
+	if sreq == nil {
 		return nil
+	}
+
+	// We need to catch up, but are already exceeding limits.
+	if js.limitsExceeded(st) {
+		s.resourcesExceededError(st)
+		return NewJSInsufficientResourcesError()
 	}
 
 	// Pause the apply channel for our raft group while we catch up.
@@ -10624,11 +10630,8 @@ RETRY:
 					return err
 				} else if err == NewJSInsufficientResourcesError() {
 					notifyLeaderStopCatchup(mrec, err)
-					mset.cfgMu.RLock()
-					storage := mset.cfg.Storage
-					mset.cfgMu.RUnlock()
-					if mset.js.limitsExceeded(storage) {
-						s.resourcesExceededError(storage)
+					if mset.js.limitsExceeded(st) {
+						s.resourcesExceededError(st)
 					} else {
 						s.Warnf("Catchup for stream '%s > %s' errored, account resources exceeded: %v", mset.account(), mset.name(), err)
 					}
