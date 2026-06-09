@@ -703,7 +703,7 @@ func TestNRGAssumeHighTermAfterCandidateIsolation(t *testing.T) {
 	// The candidate will shortly send a vote request. When that happens,
 	// the rest of the nodes in the cluster should move up to that term,
 	// even though they will not grant the vote.
-	nterm := follower.term
+	nterm := follower.Term()
 	for _, n := range rg {
 		require_Equal(t, n.node().Term(), nterm)
 	}
