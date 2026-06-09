@@ -7652,7 +7652,7 @@ func TestJetStreamClusterConsumerHealthCheckMustNotRecreate(t *testing.T) {
 
 	waitForConsumerAssignments := func() {
 		t.Helper()
-		checkFor(t, 5*time.Second, time.Second, func() error {
+		checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
 			for _, s := range c.servers {
 				if s.getJetStream().consumerAssignment(globalAccountName, "TEST", "CONSUMER") == nil {
 					return fmt.Errorf("stream assignment not found on %s", s.Name())
@@ -7663,7 +7663,7 @@ func TestJetStreamClusterConsumerHealthCheckMustNotRecreate(t *testing.T) {
 	}
 	waitForNoConsumerAssignments := func() {
 		t.Helper()
-		checkFor(t, 5*time.Second, time.Second, func() error {
+		checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
 			for _, s := range c.servers {
 				if s.getJetStream().consumerAssignment(globalAccountName, "TEST", "CONSUMER") != nil {
 					return fmt.Errorf("stream assignment still available on %s", s.Name())
@@ -7720,6 +7720,15 @@ func TestJetStreamClusterConsumerHealthCheckMustNotRecreate(t *testing.T) {
 	n := rg.node
 	n.Stop()
 	n.WaitForStop()
+
+	o := mset.lookupConsumer("CONSUMER")
+	require_NotNil(t, o)
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		if o.isMonitorRunning() {
+			return errors.New("monitor goroutine still running")
+		}
+		return nil
+	})
 
 	// The RAFT node should be closed. Checking health must not change that.
 	// Simulates a race condition where we're shutting down.
