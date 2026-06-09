@@ -7712,6 +7712,63 @@ func TestJetStreamConsumerDefaultsFromStream(t *testing.T) {
 			t.Fatalf("stream update should have errored but didn't")
 		}
 	})
+
+	t.Run("UpdateStreamSpuriousMaxAckPending", func(t *testing.T) {
+		_, err := acc.addStream(&StreamConfig{
+			Name:     "spurious-maxack",
+			Subjects: []string{"spurious-maxack.*"},
+		})
+		require_NoError(t, err)
+
+		_, err = js.AddConsumer("spurious-maxack", &nats.ConsumerConfig{
+			Name:      "consumer",
+			AckPolicy: nats.AckExplicitPolicy,
+		})
+		require_NoError(t, err)
+
+		mset, err := acc.lookupStream("spurious-maxack")
+		require_NoError(t, err)
+
+		require_NoError(t, mset.update(&StreamConfig{
+			Name:     "spurious-maxack",
+			Subjects: []string{"spurious-maxack.*"},
+			ConsumerLimits: StreamConsumerLimits{
+				InactiveThreshold: 10 * time.Second,
+			},
+		}))
+	})
+
+	t.Run("UpdateStreamClearInactiveThreshold", func(t *testing.T) {
+		_, err := acc.addStream(&StreamConfig{
+			Name:     "spurious-inactive",
+			Subjects: []string{"spurious-inactive.*"},
+			ConsumerLimits: StreamConsumerLimits{
+				InactiveThreshold: 10 * time.Second,
+				MaxAckPending:     1000,
+			},
+		})
+		require_NoError(t, err)
+
+		_, err = js.AddConsumer("spurious-inactive", &nats.ConsumerConfig{
+			Name:              "consumer",
+			AckPolicy:         nats.AckExplicitPolicy,
+			InactiveThreshold: 5 * time.Second,
+			MaxAckPending:     500,
+		})
+		require_NoError(t, err)
+
+		mset, err := acc.lookupStream("spurious-inactive")
+		require_NoError(t, err)
+
+		require_NoError(t, mset.update(&StreamConfig{
+			Name:     "spurious-inactive",
+			Subjects: []string{"spurious-inactive.*"},
+			ConsumerLimits: StreamConsumerLimits{
+				InactiveThreshold: 0,
+				MaxAckPending:     2000,
+			},
+		}))
+	})
 }
 
 // Server issue 4685
