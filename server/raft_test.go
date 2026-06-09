@@ -3111,6 +3111,34 @@ func TestNRGVoteResponseEncoding(t *testing.T) {
 	require_True(t, reflect.DeepEqual(decodeVoteResponse(res), vr))
 }
 
+func TestNRGDoesntRequestVoteOnWriteError(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Snoop on the vote request subject so we can tell whether we campaign.
+	nc, err := nats.Connect(n.s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+
+	sub, err := nc.SubscribeSync(n.vsubj)
+	require_NoError(t, err)
+	defer sub.Unsubscribe()
+	require_NoError(t, nc.Flush())
+
+	// Specifically not using setWriteError here because that shuts down the node
+	// and causes problems with the defer cleanup.
+	n.werr = errors.New("test write error")
+	n.state.Store(int32(Candidate))
+
+	// We can't persist our own vote, so asking for votes must be a no-op,
+	// otherwise after a restart we could vote for someone else in this term.
+	n.requestVote()
+
+	// Nothing should have been published to the vote subject.
+	_, err = sub.NextMsg(250 * time.Millisecond)
+	require_Error(t, err, nats.ErrTimeout)
+}
+
 func TestNRGInitializeAndScaleUp(t *testing.T) {
 	n, cleanup := initSingleMemRaftNode(t)
 	defer cleanup()
