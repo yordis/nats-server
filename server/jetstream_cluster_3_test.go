@@ -5976,6 +5976,84 @@ func TestJetStreamClusterConsumerDefaultsFromStream(t *testing.T) {
 	})
 }
 
+func TestJetStreamClusterConsumerLimitsUpdateGatedAtMetaLeader(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	cfg := &StreamConfig{
+		Name:     "test",
+		Subjects: []string{"test.*"},
+		Storage:  MemoryStorage,
+		Replicas: 3,
+		ConsumerLimits: StreamConsumerLimits{
+			MaxAckPending:     20,
+			InactiveThreshold: 10 * time.Second,
+		},
+	}
+	_, err := jsStreamCreate(t, nc, cfg)
+	require_NoError(t, err)
+
+	// Consumer sits right at the current stream limit.
+	_, err = js.AddConsumer("test", &nats.ConsumerConfig{
+		Name:          "consumer",
+		AckPolicy:     nats.AckExplicitPolicy,
+		MaxAckPending: 20,
+	})
+	require_NoError(t, err)
+
+	// Reads the consumer limits the meta leader currently has assigned.
+	metaLeaderLimits := func() StreamConsumerLimits {
+		t.Helper()
+		var limits StreamConsumerLimits
+		checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+			ml := c.leader()
+			if ml == nil {
+				return errors.New("no meta leader")
+			}
+			sjs := ml.getJetStream()
+			sjs.mu.RLock()
+			sa := sjs.streamAssignment(globalAccountName, "test")
+			if sa == nil || sa.Config == nil {
+				sjs.mu.RUnlock()
+				return errors.New("no stream assignment")
+			}
+			limits = sa.Config.ConsumerLimits
+			sjs.mu.RUnlock()
+			return nil
+		})
+		return limits
+	}
+
+	// Sanity: the meta leader has the original limits assigned.
+	require_Equal(t, metaLeaderLimits().MaxAckPending, 20)
+
+	// Lowering MaxAckPending below the existing consumer must be rejected.
+	badCfg := *cfg
+	badCfg.ConsumerLimits.MaxAckPending = 10
+	_, err = jsStreamUpdate(t, nc, &badCfg)
+	require_Error(t, err, NewJSStreamUpdateError(fmt.Errorf("change to limits violates consumers: consumer")))
+
+	// And crucially, the meta leader must not have committed the rejected config:
+	// the assignment should still carry the original limit, not the rejected one.
+	require_Equal(t, metaLeaderLimits().MaxAckPending, 20)
+
+	// A valid update (raise the limit) should still succeed.
+	goodCfg := *cfg
+	goodCfg.ConsumerLimits.MaxAckPending = 30
+	_, err = jsStreamUpdate(t, nc, &goodCfg)
+	require_NoError(t, err)
+	require_Equal(t, metaLeaderLimits().MaxAckPending, 30)
+
+	// Clearing a limit to zero (unlimited) must not be treated as a violation.
+	clearCfg := *cfg
+	clearCfg.ConsumerLimits.MaxAckPending = 0
+	_, err = jsStreamUpdate(t, nc, &clearCfg)
+	require_NoError(t, err)
+}
+
 // Discovered that we are not properly setting certain default filestore blkSizes.
 func TestJetStreamClusterCheckFileStoreBlkSizes(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)

@@ -2420,8 +2420,10 @@ func (mset *stream) updateWithAdvisory(config *StreamConfig, sendAdvisory bool, 
 
 	// In the event that some of the stream-level limits have changed, yell appropriately
 	// if any of the consumers exceed that limit.
-	updateLimits := ocfg.ConsumerLimits.InactiveThreshold != cfg.ConsumerLimits.InactiveThreshold ||
-		ocfg.ConsumerLimits.MaxAckPending != cfg.ConsumerLimits.MaxAckPending
+	oldInactiveThreshold, newInactiveThreshold := ocfg.ConsumerLimits.InactiveThreshold, cfg.ConsumerLimits.InactiveThreshold
+	oldMaxAckPending, newMaxAckPending := ocfg.ConsumerLimits.MaxAckPending, cfg.ConsumerLimits.MaxAckPending
+	updateLimits := (newInactiveThreshold > 0 && oldInactiveThreshold != newInactiveThreshold) ||
+		(newMaxAckPending > 0 && oldMaxAckPending != newMaxAckPending)
 	if updateLimits {
 		var errorConsumers []string
 		consumers := map[string]*ConsumerConfig{}
@@ -2435,8 +2437,8 @@ func (mset *stream) updateWithAdvisory(config *StreamConfig, sendAdvisory bool, 
 			}
 		}
 		for name, ccfg := range consumers {
-			if ccfg.InactiveThreshold > cfg.ConsumerLimits.InactiveThreshold ||
-				ccfg.MaxAckPending > cfg.ConsumerLimits.MaxAckPending {
+			if (newInactiveThreshold > 0 && ccfg.InactiveThreshold > newInactiveThreshold) ||
+				(newMaxAckPending > 0 && ccfg.MaxAckPending > newMaxAckPending) {
 				errorConsumers = append(errorConsumers, name)
 			}
 		}
