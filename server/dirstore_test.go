@@ -392,9 +392,22 @@ func createTestAccount(t *testing.T, dirStore *DirJWTStore, expSec int, accKey n
 
 func assertStoreSize(t *testing.T, dirStore *DirJWTStore, length int) {
 	t.Helper()
-	f, err := os.ReadDir(dirStore.directory)
+	// Count actual JWT files recursively. In shard mode files are nested in
+	// subdirectories named by the key's last two characters, so a plain
+	// os.ReadDir of the top-level directory would miscount when two keys share
+	// the same shard suffix.
+	var fileCnt int
+	err := filepath.Walk(dirStore.directory, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() && strings.HasSuffix(path, fileExtension) {
+			fileCnt++
+		}
+		return nil
+	})
 	require_NoError(t, err)
-	require_Len(t, len(f), length)
+	require_Len(t, fileCnt, length)
 	dirStore.Lock()
 	require_Len(t, len(dirStore.expiration.idx), length)
 	require_Len(t, dirStore.expiration.lru.Len(), length)
