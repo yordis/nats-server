@@ -972,11 +972,11 @@ func (c *client) applyAccountLimits() {
 	}
 	wasUnlimited := c.mpay == jwt.NoLimit
 	if minLimit(&c.mpay, mPay) && !wasUnlimited {
-		c.Errorf("Max Payload set to %d from server overrides account or user config", opts.MaxPayload)
+		c.Debugf("Max Payload set to %d from server overrides account or user config", opts.MaxPayload)
 	}
 	wasUnlimited = c.msubs == jwt.NoLimit
 	if minLimit(&c.msubs, mSubs) && !wasUnlimited {
-		c.Errorf("Max Subscriptions set to %d from server overrides account or user config", opts.MaxSubs)
+		c.Debugf("Max Subscriptions set to %d from server overrides account or user config", opts.MaxSubs)
 	}
 	if c.subsAtLimit() {
 		go func() {
