@@ -5454,6 +5454,55 @@ func TestNRGInstallSnapshotFromCheckpoint(t *testing.T) {
 	require_Error(t, err, errors.New("snapshot index mismatch"))
 }
 
+func TestNRGSnapshotCheckpointNodeClosed(t *testing.T) {
+	for _, test := range []struct {
+		title string
+		close func(n *raft)
+	}{
+		{title: "Stop", close: func(n *raft) { n.Stop() }},
+		{title: "Delete", close: func(n *raft) { n.Delete() }},
+	} {
+		t.Run(test.title, func(t *testing.T) {
+			n, cleanup := initSingleMemRaftNode(t)
+			defer cleanup()
+
+			// Create a sample entry, the content doesn't matter, just that it's stored.
+			esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+			entries := []*Entry{newEntry(EntryNormal, esm)}
+
+			nats0 := "S1Nunr6R" // "nats-0"
+
+			aeMsg := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries})
+			aeHeartbeat := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 1, entries: nil})
+
+			n.processAppendEntry(aeMsg, n.aesub)
+			n.processAppendEntry(aeHeartbeat, n.aesub)
+			require_Equal(t, n.commit, 1)
+			n.Applied(1)
+			require_Equal(t, n.applied, 1)
+
+			// Create the checkpoint while the node is still healthy.
+			c, err := n.CreateSnapshotCheckpoint(false)
+			require_NoError(t, err)
+
+			// Stop/delete the node.
+			test.close(n)
+
+			// All checkpoint paths must now report the node as closed.
+			_, err = c.LoadLastSnapshot()
+			require_Error(t, err, errNodeClosed)
+			var count int
+			for _, err = range c.AppendEntriesSeq() {
+				count++
+				require_Error(t, err, errNodeClosed)
+			}
+			require_Equal(t, count, 1) // Must always iterate at least once to retrieve the error.
+			_, err = c.InstallSnapshot(nil)
+			require_Error(t, err, errNodeClosed)
+		})
+	}
+}
+
 func TestNRGInstallSnapshotForce(t *testing.T) {
 	n, cleanup := initSingleMemRaftNode(t)
 	defer cleanup()
