@@ -5187,9 +5187,10 @@ func TestNRGAppendEntryResurrectsLeader(t *testing.T) {
 
 	S2 := "z3WIzPtj" // S-2
 
+	n.Lock()
 	n.addPeer(S2)
-
-	require_Equal(t, len(n.peers), 2)
+	n.Unlock()
+	require_Len(t, len(n.Peers()), 2)
 	require_Equal(t, n.ClusterSize(), 2)
 
 	// PeerRemove S2
@@ -5203,7 +5204,7 @@ func TestNRGAppendEntryResurrectsLeader(t *testing.T) {
 		leader: S2, term: 1, commit: 1, pterm: 1, pindex: 1, entries: nil})
 	n.processAppendEntry(aeHeartBeat, n.aesub)
 
-	require_Equal(t, len(n.peers), 1)
+	require_Len(t, len(n.Peers()), 1)
 	require_Equal(t, n.ClusterSize(), 1)
 
 	// If bug is present: receiving a appendEntry from the old leader
@@ -5214,7 +5215,7 @@ func TestNRGAppendEntryResurrectsLeader(t *testing.T) {
 	n.processAppendEntry(aeHeartBeat2, n.aesub)
 
 	// Expect the cluster size to be unchanged
-	require_Equal(t, len(n.peers), 1)
+	require_Len(t, len(n.Peers()), 1)
 	require_Equal(t, n.ClusterSize(), 1)
 }
 
@@ -5988,8 +5989,10 @@ func TestNRGOnlyCommitIfCurrentTerm(t *testing.T) {
 	s2 := getHash("S-2")
 	s3 := getHash("S-3")
 
+	n.Lock()
 	n.addPeer(s2)
 	n.addPeer(s3)
+	n.Unlock()
 	require_Len(t, len(n.Peers()), 3)
 
 	// The below timeline describes a test ensuring a leader doesn't commit entries from previous terms.
