@@ -84,6 +84,8 @@ type jetStreamCluster struct {
 	// Track last meta snapshot time and duration for monitoring.
 	lastMetaSnapTime     int64 // Unix nanoseconds
 	lastMetaSnapDuration int64 // Duration in nanoseconds
+	// If a write error was encountered while applying meta entries, and if so what error.
+	werr error
 }
 
 // Used to track inflight stream create/update/delete requests that have been proposed but not yet applied.
@@ -836,6 +838,11 @@ func (js *jetStream) isConsumerHealthy(mset *stream, consumer string, ca *consum
 
 	oNode := o.raftNode()
 	rc, _ := o.replica()
+	var nrgWerr error
+	if node != nil {
+		nrgWerr = node.GetWriteErr()
+	}
+	consumerWerr := o.getWriteErr()
 	switch {
 	case rc <= 1:
 		return nil // No further checks for R=1 consumers
@@ -853,6 +860,12 @@ func (js *jetStream) isConsumerHealthy(mset *stream, consumer string, ca *consum
 		mset.mu.RUnlock()
 		s.Warnf("Detected consumer cluster node skew '%s > %s > %s'", accName, streamName, consumer)
 		return errors.New("cluster node skew detected")
+
+	case nrgWerr != nil:
+		return fmt.Errorf("node write error: %v", nrgWerr)
+
+	case consumerWerr != nil:
+		return fmt.Errorf("consumer write error: %v", consumerWerr)
 
 	case !o.isMonitorRunning():
 		return errors.New("monitor goroutine not running")
@@ -1443,6 +1456,45 @@ func (js *jetStream) isMetaRecovering() bool {
 	return js.metaRecovering
 }
 
+// setMetaWriteErr stores the write error on the meta group.
+func (js *jetStream) setMetaWriteErr(err error) {
+	js.mu.Lock()
+	defer js.mu.Unlock()
+	js.setMetaWriteErrLocked(err)
+}
+
+func (js *jetStream) setMetaWriteErrLocked(err error) {
+	cc := js.cluster
+	if cc == nil || cc.werr != nil {
+		return
+	}
+	// Ignore non-write errors.
+	if err == ErrStoreClosed {
+		return
+	}
+	js.srv.Errorf("JetStream cluster meta group critical write error: %v", err)
+	cc.werr = err
+	assert.Unreachable("Meta group encountered write error", map[string]any{
+		"err": err,
+	})
+
+	// Step down and put into observer mode so another server can pick up the meta leadership.
+	if node := cc.meta; node != nil {
+		node.StepDown()
+		node.SetObserver(true)
+	}
+}
+
+// getMetaWriteErr returns the write error stored on the meta group (if any).
+func (js *jetStream) getMetaWriteErr() error {
+	js.mu.RLock()
+	defer js.mu.RUnlock()
+	if js.cluster == nil {
+		return nil
+	}
+	return js.cluster.werr
+}
+
 // During recovery track any stream and consumer delete and update operations.
 type recoveryUpdates struct {
 	removeStreams   map[string]*streamAssignment
@@ -1895,7 +1947,12 @@ func (js *jetStream) monitorCluster() {
 					}
 					recovering = isRecovering
 				} else {
-					s.Warnf("Error applying JetStream cluster entries: %v", err)
+					s.Errorf("Error applying JetStream cluster entries: %v", err)
+					// Encountered an unexpected error, can't continue.
+					js.setMetaWriteErr(err)
+					ce.ReturnToPool()
+					aq.recycle(&ces)
+					return
 				}
 				ce.ReturnToPool()
 			}
@@ -2283,7 +2340,7 @@ func (js *jetStream) collectStreamAndConsumerChanges(c RaftNodeCheckpoint, strea
 					sa, err := decodeStreamAssignment(js.srv, buf[1:])
 					if err != nil {
 						js.srv.Errorf("JetStream cluster failed to decode stream assignment: %q", buf[1:])
-						panic(err)
+						return err
 					}
 					if op == removeStreamOp {
 						ru.removeStream(sa)
@@ -2294,25 +2351,25 @@ func (js *jetStream) collectStreamAndConsumerChanges(c RaftNodeCheckpoint, strea
 					ca, err := decodeConsumerAssignment(buf[1:])
 					if err != nil {
 						js.srv.Errorf("JetStream cluster failed to decode consumer assignment: %q", buf[1:])
-						panic(err)
+						return err
 					}
 					ru.addOrUpdateConsumer(ca)
 				case assignCompressedConsumerOp:
 					ca, err := decodeConsumerAssignmentCompressed(buf[1:])
 					if err != nil {
 						js.srv.Errorf("JetStream cluster failed to decode compressed consumer assignment: %q", buf[1:])
-						panic(err)
+						return err
 					}
 					ru.addOrUpdateConsumer(ca)
 				case removeConsumerOp:
 					ca, err := decodeConsumerAssignment(buf[1:])
 					if err != nil {
 						js.srv.Errorf("JetStream cluster failed to decode consumer assignment: %q", buf[1:])
-						panic(err)
+						return err
 					}
 					ru.removeConsumer(ca)
 				default:
-					panic(fmt.Sprintf("JetStream Cluster Unknown meta entry op type: %v", entryOp(buf[0])))
+					return fmt.Errorf("unknown meta entry op type: %v", entryOp(buf[0]))
 				}
 			}
 		}
@@ -2736,7 +2793,7 @@ func (js *jetStream) applyMetaEntries(entries []*Entry, ru *recoveryUpdates) (bo
 					js.processUpdateStreamAssignment(sa)
 				}
 			default:
-				panic(fmt.Sprintf("JetStream Cluster Unknown meta entry op type: %v", entryOp(buf[0])))
+				return isRecovering, didSnap, fmt.Errorf("unknown meta entry op type: %v", entryOp(buf[0]))
 			}
 		}
 	}
@@ -3409,7 +3466,7 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 						aq.recycle(&ces)
 						return
 					}
-					s.Errorf("Error applying entries to '%s > %s': %v", accName, sa.Config.Name, err)
+					s.Errorf("Error applying stream entries to '%s > %s': %v", accName, sa.Config.Name, err)
 					if isClusterResetErr(err) {
 						if mset.isMirror() && mset.IsLeader() {
 							mset.retryMirrorConsumer()
@@ -3598,6 +3655,10 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 					}
 				}
 			}
+			// We may have lost leadership while the restore was running.
+			if err == nil && !isLeader {
+				err = errNotLeader
+			}
 			if err != nil {
 				if mset != nil {
 					mset.delete()
@@ -3618,10 +3679,6 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 				// Send response to the metadata leader. They will forward to the user as needed.
 				s.sendInternalMsgLocked(streamAssignmentSubj, _EMPTY_, nil, result)
 				return
-			}
-
-			if !isLeader {
-				panic("Finished restore but not leader")
 			}
 			// Trigger the stream followers to catchup.
 			if n = mset.raftNode(); n != nil {
@@ -3937,7 +3994,7 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 			if op == batchMsgOp {
 				batchId, batchSeq, _, _, err := decodeBatchMsg(buf[1:])
 				if err != nil {
-					panic(err.Error())
+					return 0, err
 				}
 				// Initialize if unset.
 				if batch == nil {
@@ -3977,7 +4034,7 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 							batch.mu.Unlock()
 							mset.mu.Unlock()
 							if err != nil {
-								panic(err.Error())
+								return 0, err
 							}
 							continue
 						}
@@ -3997,7 +4054,7 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 			} else if op == batchCommitMsgOp {
 				batchId, batchSeq, _, _, err := decodeBatchMsg(buf[1:])
 				if err != nil {
-					panic(err.Error())
+					return 0, err
 				}
 
 				// Ensure the whole batch is fully isolated, and reads
@@ -4033,7 +4090,7 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 						batch.mu.Unlock()
 						mset.mu.Unlock()
 						if err != nil {
-							panic(err.Error())
+							return 0, err
 						}
 						continue
 					}
@@ -4058,22 +4115,24 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 						// Otherwise, all entries are used.
 						entries = bce.Entries
 					}
+					clearAndUnlock := func() {
+						// Make sure to return remaining entries to the pool on an error.
+						for _, nce := range batch.entries[j:] {
+							nce.ReturnToPool()
+						}
+						// Important to clear, otherwise we could return the entries to the pool multiple times.
+						batch.clearBatchStateLocked()
+						batch.mu.Unlock()
+						mset.mu.Unlock()
+					}
 					for _, entry := range entries {
 						_, _, op, buf, err = decodeBatchMsg(entry.Data[1:])
 						if err != nil {
-							batch.mu.Unlock()
-							mset.mu.Unlock()
-							panic(err.Error())
+							clearAndUnlock()
+							return 0, err
 						}
 						if err = js.applyStreamMsgOp(mset, op, buf, isRecovering, false); err != nil {
-							// Make sure to return remaining entries to the pool on an error.
-							for _, nce := range batch.entries[j:] {
-								nce.ReturnToPool()
-							}
-							// Important to clear, otherwise we could return the entries to the pool multiple times.
-							batch.clearBatchStateLocked()
-							batch.mu.Unlock()
-							mset.mu.Unlock()
+							clearAndUnlock()
 							return 0, err
 						}
 					}
@@ -4087,19 +4146,21 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 					// Get all entries up to and including the current one.
 					entries = ce.Entries[:i+1]
 				}
+				clearAndUnlock := func() {
+					// Important to clear, otherwise we could return the entries to the pool multiple times.
+					batch.clearBatchStateLocked()
+					batch.mu.Unlock()
+					mset.mu.Unlock()
+				}
 				// Process remaining entries in the current entry.
 				for _, entry := range entries {
 					_, _, op, buf, err = decodeBatchMsg(entry.Data[1:])
 					if err != nil {
-						batch.mu.Unlock()
-						mset.mu.Unlock()
-						panic(err.Error())
+						clearAndUnlock()
+						return 0, err
 					}
 					if err = js.applyStreamMsgOp(mset, op, buf, isRecovering, false); err != nil {
-						// Important to clear, otherwise we could return the entries to the pool multiple times.
-						batch.clearBatchStateLocked()
-						batch.mu.Unlock()
-						mset.mu.Unlock()
+						clearAndUnlock()
 						return 0, err
 					}
 				}
@@ -4128,7 +4189,7 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 						s.Errorf("JetStream cluster could not decode delete range for '%s > %s' [%s]",
 							mset.account(), mset.name(), node.Group())
 					}
-					panic(err.Error())
+					return 0, err
 				}
 				if dr.Num == 0 {
 					continue
@@ -4163,7 +4224,7 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 						s.Errorf("JetStream cluster could not decode delete msg for '%s > %s' [%s]",
 							mset.account(), mset.name(), node.Group())
 					}
-					panic(err.Error())
+					return 0, err
 				}
 				s := js.server()
 
@@ -4214,7 +4275,7 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 						s.Errorf("JetStream cluster could not decode purge msg for '%s > %s' [%s]",
 							mset.account(), mset.name(), node.Group())
 					}
-					panic(err.Error())
+					return 0, err
 				}
 				// If no explicit request, fill in with leader stamped last sequence to protect ourselves on replay during server start.
 				if sp.Request == nil || sp.Request.Sequence == 0 {
@@ -4250,7 +4311,7 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 					}
 				}
 			default:
-				panic(fmt.Sprintf("JetStream Cluster Unknown group entry op type: %v", op))
+				return 0, fmt.Errorf("unknown stream entry op type: %v", op)
 			}
 		} else if e.Type == EntrySnapshot {
 			// Everything operates on new replicated state. Will convert legacy snapshots to this for processing.
@@ -4378,22 +4439,24 @@ func (js *jetStream) applyStreamMsgOp(mset *stream, op entryOp, mbuf []byte, isR
 		var err error
 		mbuf, err = s2.Decode(nil, mbuf)
 		if err != nil {
-			panic(err.Error())
+			return err
 		}
 	}
 
 	subject, reply, hdr, msg, lseq, ts, sourced, err := decodeStreamMsg(mbuf)
 	if err != nil {
-		// We're going to panic below, but if we're already holding the stream lock, we should let go now.
-		// Otherwise we'll deadlock when trying to get the raft node.
-		if !needLock {
-			mset.mu.Unlock()
+		if needLock {
+			mset.mu.RLock()
 		}
-		if node := mset.raftNode(); node != nil {
+		acc, name, node := mset.accountLocked(false), mset.nameLocked(false), mset.node
+		if needLock {
+			mset.mu.RUnlock()
+		}
+		if node != nil {
 			s.Errorf("JetStream cluster could not decode stream msg for '%s > %s' [%s]",
-				mset.account(), mset.name(), node.Group())
+				acc, name, node.Group())
 		}
-		panic(err.Error())
+		return err
 	}
 
 	// Check for flowcontrol here.
@@ -6449,6 +6512,44 @@ func (o *consumer) streamAndNode() (*stream, RaftNode) {
 	return o.mset, o.node
 }
 
+// setWriteErr stores the write error in the consumer.
+func (o *consumer) setWriteErr(err error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.setWriteErrLocked(err)
+}
+
+func (o *consumer) setWriteErrLocked(err error) {
+	if o.werr != nil {
+		return
+	}
+	// Ignore non-write errors.
+	if err == ErrStoreClosed {
+		return
+	}
+	o.srv.Errorf("JetStream consumer '%s > %s > %s' critical write error: %v", o.acc.Name, o.stream, o.name, err)
+	o.werr = err
+	assert.Unreachable("Consumer encountered write error", map[string]any{
+		"account":  o.acc.Name,
+		"stream":   o.stream,
+		"consumer": o.name,
+		"err":      err,
+	})
+
+	// If consumer is replicated, put it in observer mode to make sure another server can pick it up.
+	if node := o.node; node != nil {
+		node.StepDown()
+		node.SetObserver(true)
+	}
+}
+
+// getWriteErr returns the write error stored in the consumer (if any).
+func (o *consumer) getWriteErr() error {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.werr
+}
+
 // Return the replica count for this consumer. If the consumer has been
 // stopped, this will return an error.
 func (o *consumer) replica() (int, error) {
@@ -6628,7 +6729,12 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 						doSnapshot(false)
 					}
 				} else if err != errConsumerClosed {
-					s.Warnf("Error applying consumer entries to '%s > %s'", ca.Client.serviceAccount(), ca.Name)
+					s.Errorf("Error applying consumer entries to '%s > %s': %v", ca.Client.serviceAccount(), ca.Name, err)
+					// Encountered an unexpected error, can't continue.
+					o.setWriteErr(err)
+					ce.ReturnToPool()
+					aq.recycle(&ces)
+					return
 				}
 				ce.ReturnToPool()
 			}
@@ -6793,7 +6899,7 @@ func (js *jetStream) applyConsumerEntries(o *consumer, ce *CommittedEntry, isLea
 						s.Errorf("JetStream cluster could not decode consumer snapshot for '%s > %s > %s' [%s]",
 							mset.account(), mset.name(), o, node.Group())
 					}
-					panic(err.Error())
+					return err
 				}
 
 				if err = o.store.Update(state); err != nil && err != ErrStoreOldUpdate {
@@ -6848,7 +6954,7 @@ func (js *jetStream) applyConsumerEntries(o *consumer, ce *CommittedEntry, isLea
 						s.Errorf("JetStream cluster could not decode consumer delivered update for '%s > %s > %s' [%s]",
 							mset.account(), mset.name(), o, node.Group())
 					}
-					panic(err.Error())
+					return err
 				}
 				// Make sure to update delivered under the lock.
 				o.mu.Lock()
@@ -6873,7 +6979,7 @@ func (js *jetStream) applyConsumerEntries(o *consumer, ce *CommittedEntry, isLea
 				}
 				o.mu.Unlock()
 				if err != nil {
-					panic(err.Error())
+					return err
 				}
 			case updateAcksOp:
 				dseq, sseq, err := decodeAckUpdate(buf[1:])
@@ -6883,7 +6989,7 @@ func (js *jetStream) applyConsumerEntries(o *consumer, ce *CommittedEntry, isLea
 						s.Errorf("JetStream cluster could not decode consumer ack update for '%s > %s > %s' [%s]",
 							mset.account(), mset.name(), o, node.Group())
 					}
-					panic(err.Error())
+					return err
 				}
 				if err := o.processReplicatedAck(dseq, sseq); err == errConsumerClosed {
 					return err
@@ -6964,7 +7070,7 @@ func (js *jetStream) applyConsumerEntries(o *consumer, ce *CommittedEntry, isLea
 				}
 				o.mu.Unlock()
 			default:
-				panic(fmt.Sprintf("JetStream Cluster Unknown group entry op type: %v", entryOp(buf[0])))
+				return fmt.Errorf("unknown consumer entry op type: %v", entryOp(buf[0]))
 			}
 		}
 	}
@@ -9892,6 +9998,9 @@ func decodeBatchMsg(buf []byte) (batchId string, batchSeq uint64, op entryOp, mb
 		return _EMPTY_, 0, 0, nil, errBadStreamMsg
 	}
 	buf = buf[n:]
+	if len(buf) < 1 {
+		return _EMPTY_, 0, 0, nil, errBadStreamMsg
+	}
 	op = entryOp(buf[0])
 	mbuf = buf[1:]
 	return batchId, batchSeq, op, mbuf, nil
@@ -10662,6 +10771,14 @@ RETRY:
 					}
 					msgsQ.recycle(&mrecs)
 					return err
+				} else if err == errCatchupBadMsg {
+					// A bad/corrupt catchup message (e.g. a failed s2 decode) is a
+					// deterministic failure: requesting a fresh sync from the leader
+					// returns the same bytes, so retrying would churn indefinitely.
+					notifyLeaderStopCatchup(mrec, err)
+					s.Warnf("Catchup for stream '%s > %s' errored, bad message: %v", mset.account(), mset.name(), err)
+					msgsQ.recycle(&mrecs)
+					return err
 				} else {
 					notifyLeaderStopCatchup(mrec, err)
 					s.Warnf("Catchup for stream '%s > %s' errored, will retry: %v", mset.account(), mset.name(), err)
@@ -10739,7 +10856,7 @@ func (mset *stream) processCatchupMsg(msg []byte) (uint64, error) {
 		var err error
 		mbuf, err = s2.Decode(nil, mbuf)
 		if err != nil {
-			panic(err.Error())
+			return 0, errCatchupBadMsg
 		}
 	}
 

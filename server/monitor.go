@@ -3836,11 +3836,16 @@ func (s *Server) healthz(opts *HealthzOptions) *HealthStatus {
 		metaUnhealthy = !meta.Healthy()
 		metaWerr = meta.GetWriteErr()
 	}
+	// Surface an application-level meta write error (e.g. an undecodable meta entry)
+	// in addition to the node-level write error above.
+	metaApplyErr := js.getMetaWriteErr()
 	metaRecovering := js.isMetaRecovering()
-	if meta == nil || metaNoLeader || metaClosed || metaUnhealthy || metaWerr != nil || metaRecovering {
+	if meta == nil || metaNoLeader || metaClosed || metaUnhealthy || metaWerr != nil || metaApplyErr != nil || metaRecovering {
 		var desc string
 		if metaWerr != nil {
 			desc = fmt.Sprintf("JetStream meta layer write error: %v", metaWerr)
+		} else if metaApplyErr != nil {
+			desc = fmt.Sprintf("JetStream meta layer apply error: %v", metaApplyErr)
 		} else if metaClosed {
 			desc = "JetStream meta layer is not running"
 		} else if meta != nil && metaRecovering {

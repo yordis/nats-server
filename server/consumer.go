@@ -502,6 +502,7 @@ type consumer struct {
 	// Clustered.
 	ca        *consumerAssignment
 	node      RaftNode
+	werr      error // If a write error was encountered while applying entries, and if so what error.
 	infoSub   *subscription
 	lqsent    time.Time
 	prm       map[string]struct{}

@@ -8446,3 +8446,186 @@ func TestJetStreamClusterWorkQueueConsumerCreateRejectionNoOrphan(t *testing.T) 
 		}
 	}
 }
+
+func TestJetStreamClusterDecodeStreamMsgRejectsMalformed(t *testing.T) {
+	// The field lengths are deliberately large enough that every field
+	// boundary lands past the 26-byte minimum.
+	const (
+		subjLen  = 20
+		replyLen = 10
+		hdrLen   = 10
+		msgLen   = 10
+	)
+	subject := strings.Repeat("s", subjLen)
+	reply := strings.Repeat("r", replyLen)
+	hdr := []byte(strings.Repeat("h", hdrLen))
+	body := []byte(strings.Repeat("b", msgLen))
+	valid := encodeStreamMsg(subject, reply, hdr, body, 12345, 67890, true)[1:]
+
+	// Sanity check that the valid buffer round-trips.
+	gotSubj, gotReply, gotHdr, gotMsg, lseq, ts, sourced, err := decodeStreamMsg(valid)
+	require_NoError(t, err)
+	require_Equal(t, gotSubj, subject)
+	require_Equal(t, gotReply, reply)
+	require_Equal(t, string(gotHdr), string(hdr))
+	require_Equal(t, string(gotMsg), string(body))
+	require_Equal(t, lseq, 12345)
+	require_Equal(t, ts, 67890)
+	require_True(t, sourced)
+
+	// Field boundary offsets within valid. The decoder reads, in order:
+	// lseq(8) + ts(8) + subjLen(2) + subject + replyLen(2) + reply +
+	// hdrLen(2) + hdr + msgLen(4) + msg + flags(uvarint).
+	const (
+		fixedEnd    = 8 + 8        // after lseq + ts
+		subjLenEnd  = fixedEnd + 2 // after subject length prefix
+		subjEnd     = subjLenEnd + subjLen
+		replyLenEnd = subjEnd + 2 // after reply length prefix
+		replyEnd    = replyLenEnd + replyLen
+		hdrLenEnd   = replyEnd + 2 // after hdr length prefix
+		hdrEnd      = hdrLenEnd + hdrLen
+		msgLenEnd   = hdrEnd + 4 // after msg length prefix
+		msgEnd      = msgLenEnd + msgLen
+	)
+
+	// Dropping the trailing optional flags still decodes successfully.
+	_, _, _, _, _, _, sourced, err = decodeStreamMsg(valid[:msgEnd])
+	require_NoError(t, err)
+	require_False(t, sourced) // No flags means not sourced.
+
+	for _, test := range []struct {
+		title string
+		buf   []byte
+	}{
+		{title: "Empty", buf: nil},
+		// Smaller than the fixed-size prefix (lseq+ts+subjLen+...), trips the initial length guard.
+		{title: "TooShort", buf: valid[:25]},
+		// Past the guard, but the subject claims more bytes than remain.
+		{title: "TruncatedSubj", buf: valid[:subjEnd-1]},
+		// Subject present, but the reply length prefix is missing.
+		{title: "TruncatedReplyLen", buf: valid[:subjEnd]},
+		// Reply claims more bytes than remain.
+		{title: "TruncatedReply", buf: valid[:replyEnd-1]},
+		// Subject+reply present, but the header length prefix is missing.
+		{title: "TruncatedHdrLen", buf: valid[:replyEnd]},
+		// Header claims more bytes than remain.
+		{title: "TruncatedHdr", buf: valid[:hdrEnd-1]},
+		// Subject+reply+hdr present, but the msg length prefix (4 bytes) is missing.
+		{title: "TruncatedMsgLen", buf: valid[:hdrEnd]},
+		// Msg claims more bytes than remain.
+		{title: "TruncatedMsg", buf: valid[:msgEnd-1]},
+	} {
+		t.Run(test.title, func(t *testing.T) {
+			_, _, _, _, _, _, _, err = decodeStreamMsg(test.buf)
+			require_Error(t, err, errBadStreamMsg)
+		})
+	}
+}
+
+func TestJetStreamClusterDecodeBatchMsgRejectsMalformed(t *testing.T) {
+	// Build a valid encoded batch msg payload (the buffer passed to
+	// decodeBatchMsg is everything after the leading batch op byte).
+	full := encodeStreamMsgAllowCompressAndBatch("foo", _EMPTY_, nil, []byte("body"), 1, 2, false, "batch", 7, false)
+	valid := full[1:]
+
+	// Sanity check that the valid buffer round-trips.
+	batchId, batchSeq, op, mbuf, err := decodeBatchMsg(valid)
+	require_NoError(t, err)
+	require_Equal(t, batchId, "batch")
+	require_Equal(t, batchSeq, 7)
+	require_Equal(t, op, streamMsgOp)
+	require_True(t, len(mbuf) > 0)
+
+	// The mbuf left over from a valid batch msg must itself decode as a valid stream msg.
+	subject, reply, hdr, msg, lseq, ts, sourced, err := decodeStreamMsg(mbuf)
+	require_NoError(t, err)
+	require_Equal(t, subject, "foo")
+	require_Equal(t, reply, _EMPTY_)
+	require_Equal(t, len(hdr), 0)
+	require_Equal(t, string(msg), "body")
+	require_Equal(t, lseq, 1)
+	require_Equal(t, ts, 2)
+	require_False(t, sourced)
+
+	// Field boundary offsets within valid. The decoder reads, in order:
+	// batchIdLen(2) + batchId("batch") + batchSeq(uvarint, 1 byte for 7) + op(1).
+	const (
+		batchIdLenEnd = 2                            // after batchId length prefix
+		batchIdEnd    = batchIdLenEnd + len("batch") // after batchId bytes
+		batchSeqEnd   = batchIdEnd + 1               // after the single-byte seq varint
+	)
+
+	for _, test := range []struct {
+		title string
+		buf   []byte
+	}{
+		{title: "Empty", buf: nil},
+		// Smaller than the 2-byte batchId length prefix.
+		{title: "TooShort", buf: valid[:1]},
+		// Claims a batchId longer than the remaining bytes.
+		{title: "TruncatedBatchId", buf: valid[:batchIdEnd-1]},
+		// batchId present, but the batchSeq varint is missing.
+		{title: "TruncatedSeq", buf: valid[:batchIdEnd]},
+		// batchId+batchSeq present, but the op byte is missing.
+		// This previously caused an index-out-of-range panic.
+		{title: "TruncatedOp", buf: valid[:batchSeqEnd]},
+	} {
+		t.Run(test.title, func(t *testing.T) {
+			_, _, _, _, err := decodeBatchMsg(test.buf)
+			require_Error(t, err, errBadStreamMsg)
+		})
+	}
+}
+
+func TestJetStreamClusterCatchupBadMsgStopsRetrying(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		return checkState(t, c, globalAccountName, "TEST")
+	})
+
+	rs := c.randomNonStreamLeader(globalAccountName, "TEST")
+	mset, err := rs.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	sa := mset.streamAssignment()
+
+	// Make sure this server can't become the leader.
+	n := mset.raftNode().(*raft)
+	n.SetObserver(true)
+
+	sysNc, err := nats.Connect(rs.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer sysNc.Close()
+
+	sjs := rs.getJetStream()
+	sjs.mu.RLock()
+	syncSubj := sa.Sync
+	sjs.mu.RUnlock()
+
+	// Respond to the catchup with a corrupt compressed message.
+	var count atomic.Int32
+	sub, err := sysNc.Subscribe(syncSubj, func(msg *nats.Msg) {
+		count.Add(1)
+		// {0x80} is an incomplete varint and fails s2.Decode with corrupt input.
+		msg.Respond(append([]byte{byte(compressedStreamMsgOp)}, 0x80))
+	})
+	require_NoError(t, err)
+	defer sub.Drain()
+	require_NoError(t, sysNc.Flush()) // Must flush, otherwise our subscription could be too late.
+
+	err = mset.processSnapshot(&StreamReplicatedState{FirstSeq: 1, LastSeq: 1}, 1)
+	require_Error(t, err, errCatchupBadMsg)
+
+	// We must not have retried the catchup, a bad message bails out immediately.
+	require_Equal(t, count.Load(), 1)
+}
