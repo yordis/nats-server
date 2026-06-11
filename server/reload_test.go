@@ -7260,6 +7260,77 @@ func TestConfigReloadAddRemoveRemoteLeafNodes(t *testing.T) {
 	checkLeafs(nil)
 }
 
+func TestConfigReloadAddRemoveRemoteLeafNodesVarz(t *testing.T) {
+	conf1 := createConfFile(t, []byte(`
+		port: -1
+		server_name: "A"
+		leafnodes {
+			port: -1
+		}
+	`))
+	s1, o1 := RunServerWithConfig(conf1)
+	defer s1.Shutdown()
+
+	tmpl2 := `
+		port: -1
+		http: -1
+		server_name: "B"
+		accounts {
+			A: {users:[{user: "A", password: "pwd"}]}
+			B: {users:[{user: "B", password: "pwd"}]}
+		}
+		leafnodes {
+			remotes [
+				%s
+				%s
+			]
+		}
+	`
+	remoteTmpl := fmt.Sprintf(`{ url: "nats://127.0.0.1:%d"`, o1.LeafNode.Port) + ", account=%q}"
+	accA := fmt.Sprintf(remoteTmpl, "A")
+	accB := fmt.Sprintf(remoteTmpl, "B")
+	conf2 := createConfFile(t, fmt.Appendf(nil, tmpl2, accA, _EMPTY_))
+	s2, _ := RunServerWithConfig(conf2)
+	defer s2.Shutdown()
+
+	checkLeafNodeConnectedCount(t, s2, 1)
+
+	checkRemotes := func(accs ...string) {
+		t.Helper()
+		// Check both the HTTP endpoint (mode 0), which caches the Varz
+		// object, and the programmatic API (mode 1).
+		url := fmt.Sprintf("http://127.0.0.1:%d/varz", s2.MonitorAddr().Port)
+		for mode := 0; mode < 2; mode++ {
+			v := pollVarz(t, s2, mode, url, nil)
+			require_Len(t, len(v.LeafNode.Remotes), len(accs))
+			for _, acc := range accs {
+				var ok bool
+				for _, r := range v.LeafNode.Remotes {
+					if r.LocalAccount == acc {
+						ok = true
+						break
+					}
+				}
+				if !ok {
+					t.Fatalf("Mode %d: did not find account %q in varz remotes: %+v", mode, acc, v.LeafNode.Remotes)
+				}
+			}
+		}
+	}
+	// This will also populate the cached s.varz used by the HTTP endpoint.
+	checkRemotes("A")
+
+	// Add a remote with local account "B".
+	reloadUpdateConfig(t, s2, conf2, fmt.Sprintf(tmpl2, accA, accB))
+	checkLeafNodeConnectedCount(t, s2, 2)
+	checkRemotes("A", "B")
+
+	// Remove the remote with local account "A".
+	reloadUpdateConfig(t, s2, conf2, fmt.Sprintf(tmpl2, _EMPTY_, accB))
+	checkLeafNodeConnectedCount(t, s2, 1)
+	checkRemotes("B")
+}
+
 func TestConfigReloadRemoteLeafNodeNkeyChange(t *testing.T) {
 	conf1 := createConfFile(t, []byte(`
 		listen: "127.0.0.1:-1"
