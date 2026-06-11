@@ -7247,7 +7247,12 @@ func (mset *stream) processJetStreamAtomicBatchMsg(batchId, subject, reply strin
 			if opts.JetStreamLimits.MaxBatchSize > 0 {
 				maxBatchSize = opts.JetStreamLimits.MaxBatchSize
 			}
-			if batchSeq > uint64(maxBatchSize) {
+			size := batchSeq
+			// Don't count the "End Of Batch" marker toward the batch size.
+			if bytes.Equal(sliceHeader(JSBatchCommit, hdr), []byte("eob")) {
+				size--
+			}
+			if size > uint64(maxBatchSize) {
 				err := NewJSAtomicPublishTooLargeBatchError(maxBatchSize)
 				return respondError(err)
 			}
@@ -7339,7 +7344,12 @@ func (mset *stream) processJetStreamAtomicBatchMsg(batchId, subject, reply strin
 	if maxBatchSize := s.getOpts().JetStreamLimits.MaxBatchSize; maxBatchSize > 0 {
 		maxSize = maxBatchSize
 	}
-	if batchSeq > uint64(maxSize) {
+	size := batchSeq
+	// Don't count the "End Of Batch" marker toward the batch size.
+	if commitEob {
+		size--
+	}
+	if size > uint64(maxSize) {
 		b.cleanupLocked(batchId, batches)
 		batches.mu.Unlock()
 		mset.mu.Unlock()

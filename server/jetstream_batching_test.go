@@ -303,6 +303,80 @@ func TestJetStreamAtomicBatchPublishCommitEob(t *testing.T) {
 	}
 }
 
+func TestJetStreamAtomicBatchPublishCommitEobMaxBatchSize(t *testing.T) {
+	streamMaxAtomicBatchSize = 3
+	defer func() {
+		streamMaxAtomicBatchSize = streamDefaultMaxAtomicBatchSize
+	}()
+
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+
+	cfg := &StreamConfig{
+		Name:               "TEST",
+		Subjects:           []string{"foo"},
+		Storage:            FileStorage,
+		Retention:          LimitsPolicy,
+		Replicas:           1,
+		AllowAtomicPublish: true,
+	}
+	_, err := jsStreamCreate(t, nc, cfg)
+	require_NoError(t, err)
+
+	var pubAck JSPubAckResponse
+
+	// A batch of exactly the maximum size must be accepted when committed via an
+	// "End Of Batch" marker, since the marker itself is not stored as part of the batch.
+	for seq := 1; seq <= streamMaxAtomicBatchSize; seq++ {
+		m := nats.NewMsg("foo")
+		m.Header.Set("Nats-Batch-Id", "uuid")
+		m.Header.Set("Nats-Batch-Sequence", strconv.Itoa(seq))
+		require_NoError(t, nc.PublishMsg(m))
+	}
+	m := nats.NewMsg("foo")
+	m.Header.Set("Nats-Batch-Id", "uuid")
+	m.Header.Set("Nats-Batch-Sequence", strconv.Itoa(streamMaxAtomicBatchSize+1))
+	m.Header.Set("Nats-Batch-Commit", "eob")
+	rmsg, err := nc.RequestMsg(m, time.Second)
+	require_NoError(t, err)
+	require_NoError(t, json.Unmarshal(rmsg.Data, &pubAck))
+	require_True(t, pubAck.Error == nil)
+	require_Equal(t, pubAck.BatchSize, uint64(streamMaxAtomicBatchSize))
+
+	// One message over the maximum size must still be rejected when committed via EOB.
+	for seq := 1; seq <= streamMaxAtomicBatchSize+1; seq++ {
+		m = nats.NewMsg("foo")
+		m.Header.Set("Nats-Batch-Id", "uuid2")
+		m.Header.Set("Nats-Batch-Sequence", strconv.Itoa(seq))
+		require_NoError(t, nc.PublishMsg(m))
+	}
+	m = nats.NewMsg("foo")
+	m.Header.Set("Nats-Batch-Id", "uuid2")
+	m.Header.Set("Nats-Batch-Sequence", strconv.Itoa(streamMaxAtomicBatchSize+2))
+	m.Header.Set("Nats-Batch-Commit", "eob")
+	rmsg, err = nc.RequestMsg(m, time.Second)
+	require_NoError(t, err)
+	pubAck = JSPubAckResponse{}
+	require_NoError(t, json.Unmarshal(rmsg.Data, &pubAck))
+	require_Error(t, pubAck.Error, NewJSAtomicPublishTooLargeBatchError(streamMaxAtomicBatchSize))
+
+	// An EOB commit marker for an unknown batch at sequence maxSize+1 means the batch
+	// itself would have exactly maxSize messages, so it should be reported as incomplete
+	// rather than too large.
+	m = nats.NewMsg("foo")
+	m.Header.Set("Nats-Batch-Id", "uuid3")
+	m.Header.Set("Nats-Batch-Sequence", strconv.Itoa(streamMaxAtomicBatchSize+1))
+	m.Header.Set("Nats-Batch-Commit", "eob")
+	rmsg, err = nc.RequestMsg(m, time.Second)
+	require_NoError(t, err)
+	pubAck = JSPubAckResponse{}
+	require_NoError(t, json.Unmarshal(rmsg.Data, &pubAck))
+	require_Error(t, pubAck.Error, NewJSAtomicPublishIncompleteBatchError())
+}
+
 func TestJetStreamAtomicBatchPublishLimits(t *testing.T) {
 	streamMaxAtomicBatchInflightPerStream = 1
 	streamMaxAtomicBatchInflightTotal = 1
