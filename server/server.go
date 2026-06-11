@@ -3452,15 +3452,13 @@ func (s *Server) createClientEx(conn net.Conn, inProcess bool) *client {
 			c.port = addr.srcPort
 		}
 		// At this point, err is either:
-		//  - nil => we parsed the proxy protocol header successfully
-		//  - errProxyProtoUnrecognized => we didn't detect proxy protocol at all
-		// We only clear the pre-read if we successfully read the protocol header
-		// so that the next step doesn't re-read it. Otherwise we have to assume
-		// that it's a non-proxied connection and we want the pre-read to remain
-		// for the next step.
-		if err == nil {
-			pre = proxyPre
-		}
+		//  - nil => we parsed the proxy protocol header successfully and
+		//    proxyPre holds any bytes read past the header
+		//  - errProxyProtoUnrecognized => we didn't detect proxy protocol at
+		//    all and proxyPre holds the bytes that detection consumed (which
+		//    may include bytes read directly from the socket beyond the
+		//    original pre-read), so they must be replayed to the next step.
+		pre = proxyPre
 		// Because we have ProxyProtocol enabled, our earlier INFO message didn't
 		// include the client_ip. If we need to send it again then we will include
 		// it, but sending it here immediately can confuse clients who have just

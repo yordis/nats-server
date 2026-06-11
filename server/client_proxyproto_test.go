@@ -755,3 +755,46 @@ func TestClientProxyProtoV2WithRequiredTLS(t *testing.T) {
 		return nil
 	})
 }
+
+func TestClientProxyProtoNonProxiedTLSFirstFallback(t *testing.T) {
+	tc := &TLSConfigOpts{
+		CertFile: "../test/configs/certs/server-cert.pem",
+		KeyFile:  "../test/configs/certs/server-key.pem",
+		CaFile:   "../test/configs/certs/ca.pem",
+	}
+	tlsConfig, err := GenTLSConfig(tc)
+	require_NoError(t, err)
+
+	opts := DefaultOptions()
+	opts.Port = -1
+	opts.ProxyProtocol = true
+	opts.TLSConfig = tlsConfig
+	opts.TLSTimeout = 2
+	opts.TLSHandshakeFirst = true
+	opts.TLSHandshakeFirstFallback = 250 * time.Millisecond
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	rawConn, err := net.Dial("tcp", s.Addr().String())
+	require_NoError(t, err)
+	defer rawConn.Close()
+	require_NoError(t, rawConn.SetDeadline(time.Now().Add(5*time.Second)))
+
+	// Direct TLS-first client: start the handshake right away (within the
+	// fallback delay), no PROXY header.
+	tlsConn := tls.Client(rawConn, proxyProtoTLSClientConfig(t))
+	require_NoError(t, tlsConn.Handshake())
+
+	cr := bufio.NewReader(tlsConn)
+	infoLine, err := cr.ReadString('\n')
+	require_NoError(t, err)
+	require_True(t, strings.HasPrefix(infoLine, "INFO "))
+
+	_, err = tlsConn.Write([]byte("CONNECT {\"verbose\":true,\"pedantic\":false,\"protocol\":1}\r\nPING\r\n"))
+	require_NoError(t, err)
+
+	line, err := cr.ReadString('\n')
+	require_NoError(t, err)
+	require_True(t, strings.HasPrefix(line, "+OK"))
+	expectPong(t, cr)
+}

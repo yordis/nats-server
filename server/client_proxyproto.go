@@ -125,7 +125,9 @@ func detectProxyProtoVersion(conn net.Conn) (version int, header []byte, err err
 	case proxyProtoV2Sig[:6]:
 		return 2, header, nil
 	default:
-		return 0, nil, errProxyProtoUnrecognized
+		// Return the consumed bytes so the caller can replay them into the
+		// next protocol layer instead of discarding them.
+		return 0, header, errProxyProtoUnrecognized
 	}
 }
 
@@ -236,10 +238,12 @@ func readProxyProtoHeader(conn net.Conn) (*proxyProtoAddr, []byte, error) {
 	}
 	defer conn.SetReadDeadline(time.Time{})
 
-	// Detect version
+	// Detect version.
+	// On errProxyProtoUnrecognized, firstBytes holds the bytes that were
+	// consumed so the caller can replay them.
 	version, firstBytes, err := detectProxyProtoVersion(conn)
 	if err != nil {
-		return nil, nil, err
+		return nil, firstBytes, err
 	}
 
 	switch version {
