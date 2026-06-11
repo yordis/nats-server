@@ -683,6 +683,22 @@ func connectToRemoteLeafNode(s *Server, remote *leafNodeCfg, firstConnect bool) 
 		return false
 	}
 
+	// If this remote is no longer valid by the time we return (e.g. it was
+	// removed or disabled through a configuration reload), we will never
+	// reconnect, so clear any JetStream observer state. Otherwise, the raft
+	// nodes of this account's assets would remain observers.
+	defer func() {
+		if remote.stillValid() {
+			return
+		}
+		s.mu.RLock()
+		shouldMigrate := remote.JetStreamClusterMigrate
+		s.mu.RUnlock()
+		if shouldMigrate {
+			s.clearObserverState(remote)
+		}
+	}()
+
 	opts := s.getOpts()
 	reconnectDelay := opts.LeafNode.ReconnectInterval
 	s.mu.RLock()

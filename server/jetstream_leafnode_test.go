@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -1437,6 +1438,79 @@ func TestJetStreamLeafNodeJSClusterMigrateRecoveryWithDelay(t *testing.T) {
 	// have failed to elect a stream leader as they were stuck on a
 	// long election timer. Now this should work reliably.
 	lnc.waitOnStreamLeader(globalAccountName, "TEST")
+}
+
+func TestJetStreamLeafNodeJSClusterMigrateClearObserverOnRemoteRemoval(t *testing.T) {
+	tmpl := strings.Replace(jsClusterAccountsTempl, "store_dir:", "domain: hub, store_dir:", 1)
+	c := createJetStreamCluster(t, tmpl, "hub", _EMPTY_, 3, 12232, true)
+	defer c.shutdown()
+
+	tmpl = strings.Replace(jsClusterTemplWithLeafNode, "store_dir:", "domain: leaf, store_dir:", 1)
+	lnc := c.createLeafNodesWithTemplateAndStartPort(tmpl, "leaf", 3, 23913)
+	defer lnc.shutdown()
+
+	lnc.waitOnClusterReady()
+	for _, s := range lnc.servers {
+		s.setJetStreamMigrateOnRemoteLeaf()
+	}
+
+	nc, _ := jsClientConnect(t, lnc.randomServer())
+	defer nc.Close()
+
+	ljs, err := nc.JetStream(nats.Domain("leaf"))
+	require_NoError(t, err)
+
+	// Create an asset in the leafnode cluster.
+	si, err := ljs.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+	require_Equal(t, si.Cluster.Name, "leaf")
+
+	// Take down the leafnode connections of one of the leaf servers so
+	// that checkJetStreamMigrate kicks in and moves its assets' raft
+	// nodes into observer mode.
+	s := lnc.randomServer()
+	s.closeAndDisableLeafnodes()
+	checkLeafNodeConnectedCount(t, s, 0)
+
+	checkFor(t, maxElectionTimeout, 200*time.Millisecond, func() error {
+		s.rnMu.RLock()
+		defer s.rnMu.RUnlock()
+		for name, n := range s.raftNodes {
+			// The metagroup is not expected to become an observer,
+			// but all other assets should.
+			if name != defaultMetaGroupName && !n.IsObserver() {
+				return fmt.Errorf("expected %q to be an observer", name)
+			}
+		}
+		return nil
+	})
+
+	// Now remove the leafnode remotes from the configuration of that
+	// server and reload. Since we will never reconnect, the observer
+	// state should be cleared so this server's assets can become
+	// leaders again.
+	content, err := os.ReadFile(s.configFile)
+	require_NoError(t, err)
+	re := regexp.MustCompile(`(?s)remotes \[.*?\n\t\t\]`)
+	newContent := re.ReplaceAllString(string(content), "remotes [ ]")
+	require_NotEqual(t, string(content), newContent)
+	changeCurrentConfigContentWithNewContent(t, s.configFile, []byte(newContent))
+	require_NoError(t, s.Reload())
+
+	checkFor(t, 5*time.Second, 200*time.Millisecond, func() error {
+		s.rnMu.RLock()
+		defer s.rnMu.RUnlock()
+		for name, n := range s.raftNodes {
+			if n.IsObserver() {
+				return fmt.Errorf("expected %q to no longer be an observer", name)
+			}
+		}
+		return nil
+	})
 }
 
 // This will test that when a mirror or source construct is setup across a leafnode/domain
