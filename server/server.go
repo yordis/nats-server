@@ -3402,17 +3402,14 @@ func (s *Server) createClientEx(conn net.Conn, inProcess bool) *client {
 	// If we have both TLS and non-TLS allowed we need to see which
 	// one the client wants. We'll always allow this for in-process
 	// connections.
-	if !isClosed && !tlsFirst && opts.TLSConfig != nil && (inProcess || opts.AllowNonTLS) {
+	sniffTLS := !tlsFirst && opts.TLSConfig != nil && (inProcess || opts.AllowNonTLS)
+	if !isClosed && sniffTLS {
 		pre = make([]byte, 6) // Minimum 6 bytes for proxy proto in next step.
 		c.nc.SetReadDeadline(time.Now().Add(secondsToDuration(opts.TLSTimeout)))
 		n, _ := io.ReadFull(c.nc, pre[:])
 		c.nc.SetReadDeadline(time.Time{})
 		pre = pre[:n]
-		if n > 0 && pre[0] == 0x16 {
-			tlsRequired = true
-		} else {
-			tlsRequired = false
-		}
+		tlsRequired = n > 0 && pre[0] == 0x16
 	}
 
 	// Check for proxy protocol if enabled. The PROXY header is sent as
@@ -3459,6 +3456,20 @@ func (s *Server) createClientEx(conn net.Conn, inProcess bool) *client {
 		//    may include bytes read directly from the socket beyond the
 		//    original pre-read), so they must be replayed to the next step.
 		pre = proxyPre
+		if err == nil && sniffTLS {
+			// If we sniffed for TLS-vs-plaintext above, the byte we looked
+			// at belonged to the PROXY header, not to the client's actual
+			// traffic. Re-evaluate using the first byte that follows the
+			// header (reading it from the connection if needed).
+			if len(pre) == 0 {
+				buf := make([]byte, 1)
+				c.nc.SetReadDeadline(time.Now().Add(secondsToDuration(opts.TLSTimeout)))
+				n, _ := io.ReadFull(c.nc, buf)
+				c.nc.SetReadDeadline(time.Time{})
+				pre = buf[:n]
+			}
+			tlsRequired = len(pre) > 0 && pre[0] == 0x16
+		}
 		// Because we have ProxyProtocol enabled, our earlier INFO message didn't
 		// include the client_ip. If we need to send it again then we will include
 		// it, but sending it here immediately can confuse clients who have just

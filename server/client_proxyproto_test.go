@@ -798,3 +798,94 @@ func TestClientProxyProtoNonProxiedTLSFirstFallback(t *testing.T) {
 	require_True(t, strings.HasPrefix(line, "+OK"))
 	expectPong(t, cr)
 }
+
+// runProxyProtoAllowNonTLSServer starts a server with proxy_protocol and a
+// TLS listener that also allows non-TLS clients (allow_non_tls).
+func runProxyProtoAllowNonTLSServer(t *testing.T) *Server {
+	t.Helper()
+	tc := &TLSConfigOpts{
+		CertFile: "../test/configs/certs/server-cert.pem",
+		KeyFile:  "../test/configs/certs/server-key.pem",
+		CaFile:   "../test/configs/certs/ca.pem",
+	}
+	tlsConfig, err := GenTLSConfig(tc)
+	require_NoError(t, err)
+
+	opts := DefaultOptions()
+	opts.Port = -1
+	opts.ProxyProtocol = true
+	opts.TLSConfig = tlsConfig
+	opts.TLSTimeout = 2
+	opts.AllowNonTLS = true
+	return RunServer(opts)
+}
+
+// testClientProxyProtoAllowNonTLS verifies that with proxy_protocol and
+// allow_non_tls, the TLS-vs-plaintext detection is performed on the first
+// byte of the client's actual traffic, not on the first byte of the PROXY
+// header. Both a TLS client and a plaintext client behind the proxy must
+// be able to connect on the same listener.
+func testClientProxyProtoAllowNonTLS(t *testing.T, header []byte, clientIP string, clientPort uint16) {
+	t.Helper()
+	s := runProxyProtoAllowNonTLSServer(t)
+	defer s.Shutdown()
+
+	// TLS client behind the proxy: the sniff must detect the TLS
+	// ClientHello that follows the PROXY header.
+	cr, tlsConn := connectProxyProtoTLS(t, s.Addr().String(), header)
+	defer tlsConn.Close()
+
+	_, err := tlsConn.Write([]byte("CONNECT {\"verbose\":true,\"pedantic\":false,\"protocol\":1}\r\nPING\r\n"))
+	require_NoError(t, err)
+
+	line, err := cr.ReadString('\n')
+	require_NoError(t, err)
+	require_True(t, strings.HasPrefix(line, "+OK"))
+	expectPong(t, cr)
+
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		if findProxyProtoClient(t, s, clientIP, clientPort) == nil {
+			return fmt.Errorf("no client with PROXY-supplied host/port yet")
+		}
+		return nil
+	})
+
+	// Plaintext client behind the proxy must still be allowed.
+	rawConn, err := net.Dial("tcp", s.Addr().String())
+	require_NoError(t, err)
+	defer rawConn.Close()
+	require_NoError(t, rawConn.SetDeadline(time.Now().Add(5*time.Second)))
+
+	_, err = rawConn.Write(header)
+	require_NoError(t, err)
+
+	plainReader := bufio.NewReader(rawConn)
+	infoLine, err := plainReader.ReadString('\n')
+	require_NoError(t, err)
+	require_True(t, strings.HasPrefix(infoLine, "INFO "))
+
+	_, err = rawConn.Write([]byte("CONNECT {\"verbose\":true,\"pedantic\":false,\"protocol\":1}\r\nPING\r\n"))
+	require_NoError(t, err)
+
+	line, err = plainReader.ReadString('\n')
+	require_NoError(t, err)
+	require_True(t, strings.HasPrefix(line, "+OK"))
+	expectPong(t, plainReader)
+}
+
+// TestClientProxyProtoV1WithAllowNonTLS verifies that a proxied TLS client is
+// detected as TLS (and a proxied plaintext client as non-TLS) when the
+// listener has both tls and allow_non_tls configured, using a PROXY v1 header.
+func TestClientProxyProtoV1WithAllowNonTLS(t *testing.T) {
+	clientIP, clientPort := "203.0.113.60", uint16(54331)
+	header := buildProxyV1Header(t, "TCP4", clientIP, "127.0.0.1", clientPort, 4222)
+	testClientProxyProtoAllowNonTLS(t, header, clientIP, clientPort)
+}
+
+// TestClientProxyProtoV2WithAllowNonTLS is the v2 counterpart to
+// TestClientProxyProtoV1WithAllowNonTLS.
+func TestClientProxyProtoV2WithAllowNonTLS(t *testing.T) {
+	clientIP, clientPort := "203.0.113.61", uint16(54332)
+	header := buildProxyV2Header(t, clientIP, "127.0.0.1", clientPort, 4222, proxyProtoFamilyInet)
+	testClientProxyProtoAllowNonTLS(t, header, clientIP, clientPort)
+}
