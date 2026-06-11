@@ -447,6 +447,40 @@ func TestClientProxyProtoV1ParseTCP6(t *testing.T) {
 	require_Equal(t, addr.dstPort, 4222)
 }
 
+func TestClientProxyProtoV1ParseTCP6IPv4Mapped(t *testing.T) {
+	// Dual-stack proxies can emit IPv4-mapped IPv6 addresses for TCP6
+	// (an IPv4 client connecting to an IPv6 socket). These are valid IPv6
+	// textual addresses and must be accepted, matching the v2 parser.
+	header := buildProxyV1Header(t, "TCP6", "::ffff:192.0.2.1", "::ffff:10.0.0.1", 1234, 4222)
+	conn := newMockConn(header)
+
+	addr, _, err := readProxyProtoHeader(conn)
+	require_NoError(t, err)
+	require_NotNil(t, addr)
+
+	require_Equal(t, addr.srcIP.String(), "192.0.2.1")
+	require_Equal(t, addr.srcPort, 1234)
+
+	require_Equal(t, addr.dstIP.String(), "10.0.0.1")
+	require_Equal(t, addr.dstPort, 4222)
+}
+
+func TestClientProxyProtoV1MismatchedDestProtocol(t *testing.T) {
+	// TCP4 with IPv6 destination address
+	header := buildProxyV1Header(t, "TCP4", "192.168.1.1", "2001:db8::2", 12345, 443)
+	conn := newMockConn(header)
+
+	_, _, err := readProxyProtoHeader(conn)
+	require_Error(t, err, errProxyProtoInvalid)
+
+	// TCP6 with IPv4 destination address
+	header2 := buildProxyV1Header(t, "TCP6", "2001:db8::1", "10.0.0.1", 12345, 443)
+	conn2 := newMockConn(header2)
+
+	_, _, err = readProxyProtoHeader(conn2)
+	require_Error(t, err, errProxyProtoInvalid)
+}
+
 func TestClientProxyProtoV1ParseUnknown(t *testing.T) {
 	header := buildProxyV1Header(t, "UNKNOWN", "", "", 0, 0)
 	conn := newMockConn(header)
