@@ -22644,6 +22644,22 @@ func TestJetStreamScheduledMessageParse(t *testing.T) {
 		// A schedule can only run at least once every second.
 		_, _, ok = parseMsgSchedule("@every 999ms", nil, 0)
 		require_False(t, ok)
+
+		// The next fire time anchors on the previous fire time rounded to the
+		// nearest second, plus the interval.
+		const interval = 1500 * time.Millisecond
+		anchor := time.Now().UTC().Add(time.Second)
+		sts, repeat, ok = parseMsgSchedule("@every 1500ms", nil, anchor.UnixNano())
+		require_True(t, ok)
+		require_True(t, repeat)
+		require_Equal(t, sts.UnixNano(), anchor.Round(time.Second).Add(interval).UnixNano())
+
+		// Re-arming from that fire time rounds again before adding the interval.
+		prev := sts
+		sts, repeat, ok = parseMsgSchedule("@every 1500ms", nil, sts.UnixNano())
+		require_True(t, ok)
+		require_True(t, repeat)
+		require_Equal(t, sts.UnixNano(), prev.Round(time.Second).Add(interval).UnixNano())
 	})
 
 	// <cron> pattern
