@@ -7427,8 +7427,14 @@ func (mset *stream) processJetStreamAtomicBatchMsg(batchId, subject, reply strin
 		return apiErr
 	}
 
+	type checkedMsg struct {
+		subj string
+		hdr  []byte
+		msg  []byte
+	}
 	var (
 		entries []*Entry
+		checked []checkedMsg
 		bsubj   string
 		bhdr    []byte
 		bmsg    []byte
@@ -7495,6 +7501,11 @@ func (mset *stream) processJetStreamAtomicBatchMsg(batchId, subject, reply strin
 			esm := encodeStreamMsgAllowCompressAndBatch(bsubj, _reply, bhdr, bmsg, mset.clseq, ts, false, batchId, seq, isCommit)
 			entries = append(entries, newEntry(EntryNormal, esm))
 			sz += len(esm)
+		} else {
+			// Preserve the (possibly rewritten) headers and message, for example for counters and
+			// scheduled messages, so the commit below stores the transformed message.
+			// Need to copy, the staged message buffer is reused on every load.
+			checked = append(checked, checkedMsg{bsubj, copyBytes(bhdr), copyBytes(bmsg)})
 		}
 		mset.clseq++
 	}
@@ -7509,16 +7520,11 @@ func (mset *stream) processJetStreamAtomicBatchMsg(batchId, subject, reply strin
 		// can only happen after the full batch is committed.
 		// We keep holding the stream lock.
 		for seq := uint64(1); seq <= batchSeq; seq++ {
-			if seq == batchSeq && !commitEob && b.store.Type() != FileStorage {
-				bsubj, bhdr, bmsg = subject, hdr, msg
-			} else if sm, err = b.store.LoadMsg(seq, &smv); sm != nil && err == nil {
-				bsubj, bhdr, bmsg = sm.subj, sm.hdr, sm.msg
-			} else {
-				// Should not happen, we've already checked this message existed while doing consistency checks.
-				// We'll just exit here, the batch is already inconsistent without the message at this sequence.
-				// No use in trying to still store the rest.
-				break
-			}
+			// Use the checked (and possibly rewritten) message from above, not the raw staged
+			// message, so transformations like counter increments and scheduled message
+			// rollups are persisted just like in the clustered proposal path.
+			cm := checked[seq-1]
+			bsubj, bhdr, bmsg = cm.subj, cm.hdr, cm.msg
 			var _reply string
 			if seq == batchSeq {
 				_reply = reply

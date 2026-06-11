@@ -1868,6 +1868,74 @@ func TestJetStreamAtomicBatchPublishExpectedPerSubject(t *testing.T) {
 	t.Run("not-first", func(t *testing.T) { test(t, NotFirst) })
 }
 
+func TestJetStreamAtomicBatchPublishCounterSingleServer(t *testing.T) {
+	test := func(t *testing.T, storage StorageType) {
+		s := RunBasicJetStreamServer(t)
+		defer s.Shutdown()
+
+		nc, js := jsClientConnect(t, s)
+		defer nc.Close()
+
+		cfg := &StreamConfig{
+			Name:               "TEST",
+			Subjects:           []string{"foo"},
+			Storage:            storage,
+			Retention:          LimitsPolicy,
+			Replicas:           1,
+			AllowAtomicPublish: true,
+			AllowMsgCounter:    true,
+		}
+		_, err := jsStreamCreate(t, nc, cfg)
+		require_NoError(t, err)
+
+		// Publish an atomic batch of two counter increments.
+		m := nats.NewMsg("foo")
+		m.Header.Set("Nats-Batch-Id", "uuid")
+		m.Header.Set("Nats-Batch-Sequence", "1")
+		m.Header.Set("Nats-Incr", "1")
+		require_NoError(t, nc.PublishMsg(m))
+
+		m = nats.NewMsg("foo")
+		m.Header.Set("Nats-Batch-Id", "uuid")
+		m.Header.Set("Nats-Batch-Sequence", "2")
+		m.Header.Set("Nats-Batch-Commit", "1")
+		m.Header.Set("Nats-Incr", "2")
+		rmsg, err := nc.RequestMsg(m, time.Second)
+		require_NoError(t, err)
+
+		var pubAck JSPubAckResponse
+		require_NoError(t, json.Unmarshal(rmsg.Data, &pubAck))
+		require_True(t, pubAck.Error == nil)
+		require_Equal(t, pubAck.Sequence, 2)
+		require_Equal(t, pubAck.BatchId, "uuid")
+		require_Equal(t, pubAck.BatchSize, 2)
+
+		// The stored messages must contain the rewritten counter payloads.
+		rsm, err := js.GetMsg("TEST", 1)
+		require_NoError(t, err)
+		require_Equal(t, string(rsm.Data), `{"val":"1"}`)
+		rsm, err = js.GetMsg("TEST", 2)
+		require_NoError(t, err)
+		require_Equal(t, string(rsm.Data), `{"val":"3"}`)
+
+		// The counter must not be broken, a normal increment should still work.
+		m = nats.NewMsg("foo")
+		m.Header.Set("Nats-Incr", "5")
+		pa, err := js.PublishMsg(m)
+		require_NoError(t, err)
+		require_Equal(t, pa.Sequence, 3)
+		rsm, err = js.GetMsg("TEST", 3)
+		require_NoError(t, err)
+		require_Equal(t, string(rsm.Data), `{"val":"8"}`)
+	}
+
+	for _, storage := range []StorageType{FileStorage, MemoryStorage} {
+		t.Run(storage.String(), func(t *testing.T) {
+			test(t, storage)
+		})
+	}
+}
+
 func TestJetStreamAtomicBatchPublishSingleServerRecovery(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
