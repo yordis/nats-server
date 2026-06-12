@@ -1377,10 +1377,11 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 	// in consumer.ackReply(), resulting in erroneous formatting of the ack subject.
 	mn := strings.ReplaceAll(cfg.Name, "%", "%%")
 	on := strings.ReplaceAll(o.name, "%", "%%")
-	domain := strings.ReplaceAll(o.srv.getOpts().JetStreamDomain, "%", "%%")
+	domain := o.srv.getOpts().JetStreamDomain
 	if domain == _EMPTY_ {
 		domain = "_"
 	}
+	dn := strings.ReplaceAll(domain, "%", "%%")
 	accHash := getHash(accName)
 
 	o.useV2Ack = s.getOpts().getFeatureFlag(FeatureFlagJsAckFormatV2)
@@ -1390,18 +1391,18 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 	o.fcSubjOld = fmt.Sprintf(jsFlowControl, cfg.Name, o.name)
 	preOld := fmt.Sprintf(jsAckT, mn, on)
 	o.ackReplyOldT = fmt.Sprintf("%s.%%d.%%d.%%d.%%d.%%d", preOld)
-	o.ackSubjOld = fmt.Sprintf("%s.*.*.*.*.*", preOld)
+	o.ackSubjOld = fmt.Sprintf(jsAckT+".*.*.*.*.*", cfg.Name, o.name)
 
 	// v2 format: $JS.(ACK|FC).<domain>.<accHash>.<stream>.<consumer>.etc.
 	o.fcPre = fmt.Sprintf("%s%s.%s.", jsFlowControlPre, domain, accHash)
 	o.fcSubj = fmt.Sprintf(jsFlowControlV2, domain, accHash, cfg.Name, o.name)
-	pre := fmt.Sprintf(jsAckTv2, domain, accHash, mn, on)
+	pre := fmt.Sprintf(jsAckTv2, dn, accHash, mn, on)
 	o.ackReplyT = fmt.Sprintf("%s.%%d.%%d.%%d.%%d.%%d", pre)
 	// Subscribe on this ack subject for v2, we require 11 tokens, but allow for more tokens/extension.
-	o.ackSubj = fmt.Sprintf("%s.*.*.*.*.>", pre)
+	o.ackSubj = fmt.Sprintf(jsAckTv2+".*.*.*.*.>", domain, accHash, cfg.Name, o.name)
 
-	o.nextMsgSubj = fmt.Sprintf(JSApiRequestNextT, mn, o.name)
-	o.resetSubj = fmt.Sprintf(JSApiConsumerResetT, mn, o.name)
+	o.nextMsgSubj = fmt.Sprintf(JSApiRequestNextT, cfg.Name, o.name)
+	o.resetSubj = fmt.Sprintf(JSApiConsumerResetT, cfg.Name, o.name)
 
 	// Check/update the inactive threshold
 	o.updateInactiveThreshold(&o.cfg)
