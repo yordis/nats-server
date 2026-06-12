@@ -1746,34 +1746,40 @@ func (s *Server) createVarz(pcpu float64, rss int64) *Varz {
 		}
 		varz.Gateway.Gateways = rgwa
 	}
-	if l := len(ln.Remotes); l > 0 {
-		rlna := make([]RemoteLeafOptsVarz, l)
-		for i, r := range ln.Remotes {
-			var deny *DenyRules
-			if len(r.DenyImports) > 0 || len(r.DenyExports) > 0 {
-				deny = &DenyRules{
-					Imports: r.DenyImports,
-					Exports: r.DenyExports,
-				}
-			}
-			remoteTlsOCSPPeerVerify := s.ocspPeerVerify && r.tlsConfigOpts != nil && r.tlsConfigOpts.OCSPPeerConfig != nil && r.tlsConfigOpts.OCSPPeerConfig.Verify
-
-			rlna[i] = RemoteLeafOptsVarz{
-				LocalAccount:      r.LocalAccount,
-				URLs:              urlsToStrings(r.URLs),
-				TLSTimeout:        r.TLSTimeout,
-				Deny:              deny,
-				TLSOCSPPeerVerify: remoteTlsOCSPPeerVerify,
-			}
-		}
-		varz.LeafNode.Remotes = rlna
-	}
-
 	// Finish setting it up with fields that can be updated during
 	// configuration reload and runtime.
 	s.updateVarzConfigReloadableFields(varz)
 	s.updateVarzRuntimeFields(varz, true, pcpu, rss)
 	return varz
+}
+
+// Builds the list of remote leafnodes for Varz from the given options.
+// Server lock is held on entry.
+func (s *Server) varzLeafNodeRemotes(opts *Options) []RemoteLeafOptsVarz {
+	l := len(opts.LeafNode.Remotes)
+	if l == 0 {
+		return nil
+	}
+	rlna := make([]RemoteLeafOptsVarz, l)
+	for i, r := range opts.LeafNode.Remotes {
+		var deny *DenyRules
+		if len(r.DenyImports) > 0 || len(r.DenyExports) > 0 {
+			deny = &DenyRules{
+				Imports: r.DenyImports,
+				Exports: r.DenyExports,
+			}
+		}
+		remoteTlsOCSPPeerVerify := s.ocspPeerVerify && r.tlsConfigOpts != nil && r.tlsConfigOpts.OCSPPeerConfig != nil && r.tlsConfigOpts.OCSPPeerConfig.Verify
+
+		rlna[i] = RemoteLeafOptsVarz{
+			LocalAccount:      r.LocalAccount,
+			URLs:              urlsToStrings(r.URLs),
+			TLSTimeout:        r.TLSTimeout,
+			Deny:              deny,
+			TLSOCSPPeerVerify: remoteTlsOCSPPeerVerify,
+		}
+	}
+	return rlna
 }
 
 func urlsToStrings(urls []*url.URL) []string {
@@ -1829,6 +1835,7 @@ func (s *Server) updateVarzConfigReloadableFields(v *Varz) {
 	v.Cluster.TLSCertNotAfter = tlsCertNotAfter(opts.Cluster.TLSConfig)
 	v.Gateway.TLSCertNotAfter = tlsCertNotAfter(opts.Gateway.TLSConfig)
 	v.LeafNode.TLSCertNotAfter = tlsCertNotAfter(opts.LeafNode.TLSConfig)
+	v.LeafNode.Remotes = s.varzLeafNodeRemotes(opts)
 	v.MQTT.TLSCertNotAfter = tlsCertNotAfter(opts.MQTT.TLSConfig)
 	v.Websocket.TLSCertNotAfter = tlsCertNotAfter(opts.Websocket.TLSConfig)
 

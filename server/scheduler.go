@@ -226,7 +226,7 @@ func (ms *MsgScheduling) getScheduledMessages(loadMsg func(seq uint64, smv *Stor
 			if !repeat {
 				hdr = genHeader(hdr, JSScheduleNext, JSScheduleNextPurge) // Purge the schedule message itself.
 			} else {
-				hdr = genHeader(hdr, JSScheduleNext, next.Format(time.RFC3339)) // Next time the schedule fires.
+				hdr = genHeader(hdr, JSScheduleNext, next.Format(time.RFC3339Nano)) // Next time the schedule fires.
 			}
 			if ttl != _EMPTY_ {
 				hdr = genHeader(hdr, JSMessageTTL, ttl)

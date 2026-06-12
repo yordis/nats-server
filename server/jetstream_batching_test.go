@@ -4279,6 +4279,118 @@ func TestJetStreamFastBatchPublishHeaderCheckError(t *testing.T) {
 	}
 }
 
+func TestJetStreamFastBatchPublishHeaderCheckErrorOnCommit(t *testing.T) {
+	test := func(t *testing.T, replicas int, gapMode string, gap bool) {
+		c := createJetStreamClusterExplicit(t, "R3S", 3)
+		defer c.shutdown()
+
+		nc := clientConnectToServer(t, c.randomServer())
+		defer nc.Close()
+
+		var batchFlowAck BatchFlowAck
+		var pubAck JSPubAckResponse
+
+		_, err := jsStreamCreate(t, nc, &StreamConfig{
+			Name:              "TEST",
+			Subjects:          []string{"foo"},
+			Storage:           FileStorage,
+			Replicas:          replicas,
+			AllowBatchPublish: true,
+		})
+		require_NoError(t, err)
+
+		inbox := nats.NewInbox()
+		sub, err := nc.SubscribeSync(fmt.Sprintf("%s.>", inbox))
+		require_NoError(t, err)
+		defer sub.Drain()
+
+		// Send the first message.
+		m := nats.NewMsg("foo")
+		m.Reply = generateFastBatchReply(inbox, "uuid", 1, 0, gapMode, FastBatchOpStart)
+		require_NoError(t, nc.PublishMsg(m))
+
+		// The first message triggered the initial flow control message.
+		rmsg, err := sub.NextMsg(time.Second)
+		require_NoError(t, err)
+		batchFlowAck = BatchFlowAck{}
+		require_NoError(t, json.Unmarshal(rmsg.Data, &batchFlowAck))
+		require_Equal(t, batchFlowAck.Messages, 10)
+
+		// Now commit the batch, but have the commit message itself fail the header checks.
+		commitSeq := uint64(2)
+		if gap {
+			commitSeq = 3
+		}
+		m.Header.Set(JSExpectedLastSeq, "100")
+		m.Reply = generateFastBatchReply(inbox, "uuid", commitSeq, 0, gapMode, FastBatchOpCommit)
+		require_NoError(t, nc.PublishMsg(m))
+
+		// A forward gap is always reported first.
+		if gap {
+			rmsg, err = sub.NextMsg(time.Second)
+			require_NoError(t, err)
+			var batchFlowGap BatchFlowGap
+			require_NoError(t, json.Unmarshal(rmsg.Data, &batchFlowGap))
+			require_Equal(t, batchFlowGap.ExpectedLastSequence, 2)
+			require_Equal(t, batchFlowGap.CurrentSequence, 3)
+		}
+
+		// The commit message should report the error based on the header.
+		rmsg, err = sub.NextMsg(time.Second)
+		require_NoError(t, err)
+		require_True(t, strings.HasPrefix(string(rmsg.Data), "{\"type\":\"err\","))
+		var batchFlowErr BatchFlowErr
+		require_NoError(t, json.Unmarshal(rmsg.Data, &batchFlowErr))
+		require_Equal(t, batchFlowErr.Sequence, commitSeq)
+		require_True(t, batchFlowErr.Error != nil)
+		require_Equal(t, batchFlowErr.Error.Error(), NewJSStreamWrongLastSequenceError(1).Error())
+
+		// Since the commit message errored, the commit must still complete and a PubAck
+		// must be sent containing the last persisted message data. Otherwise, the batch
+		// would be stranded; no PubAck, the cleanup timer stopped, and inflight accounting leaked.
+		rmsg, err = sub.NextMsg(time.Second)
+		require_NoError(t, err)
+		pubAck = JSPubAckResponse{}
+		require_NoError(t, json.Unmarshal(rmsg.Data, &pubAck))
+		require_True(t, pubAck.Error == nil)
+		require_Equal(t, pubAck.Sequence, 1)
+		require_Equal(t, pubAck.BatchId, "uuid")
+		// The batch size reflects the last accepted batch sequence, which includes skipped gaps.
+		require_Equal(t, pubAck.BatchSize, commitSeq-1)
+
+		// The batch must also be unregistered and not leak inflight accounting.
+		sl := c.streamLeader(globalAccountName, "TEST")
+		require_NotNil(t, sl)
+		mset, err := sl.globalAccount().lookupStream("TEST")
+		require_NoError(t, err)
+		mset.mu.RLock()
+		batches := mset.batches
+		mset.mu.RUnlock()
+		require_NotNil(t, batches)
+		checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+			batches.mu.Lock()
+			fastBatches := len(batches.fast)
+			batches.mu.Unlock()
+			if fastBatches != 0 {
+				return fmt.Errorf("expected no inflight fast batches, got %d", fastBatches)
+			}
+			return nil
+		})
+	}
+
+	for _, replicas := range []int{1, 3} {
+		for _, gapMode := range []string{FastBatchGapFail, FastBatchGapOk} {
+			t.Run(fmt.Sprintf("R%d/%s", replicas, gapMode), func(t *testing.T) {
+				test(t, replicas, gapMode, false)
+			})
+		}
+		// A forward gap on the commit message is only allowed in gap-ok mode.
+		t.Run(fmt.Sprintf("R%d/gap/%s", replicas, FastBatchGapOk), func(t *testing.T) {
+			test(t, replicas, FastBatchGapOk, true)
+		})
+	}
+}
+
 func TestJetStreamFastBatchPublishPing(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()

@@ -7867,7 +7867,8 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 		}
 
 		// If gaps are okay, we just allow them to continue.
-		if batch.gapOk {
+		// Unless this is the commit message, in which case we must still complete it below.
+		if batch.gapOk && !batch.commit {
 			batches.mu.Unlock()
 			return err
 		}
@@ -7876,6 +7877,10 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 		// Otherwise, the batch is cleaned up automatically later.
 		if err != errMsgIdDuplicate {
 			b.lseq--
+			// If there is none pending, correct the persisted sequence as we need to commit below.
+			if b.pending == 0 {
+				b.pseq = b.lseq
+			}
 		}
 		if cleanup = batches.fastBatchCommit(b, batch.id, mset, reply); cleanup {
 			b.cleanupLocked(batch.id, batches)
