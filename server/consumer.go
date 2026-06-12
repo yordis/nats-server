@@ -2189,11 +2189,11 @@ func (o *consumer) deleteNotActive() {
 		l := len(o.cfg.BackOff)
 		var delay time.Duration
 		var ackWait time.Duration
-		for _, p := range o.pending {
+		for seq, p := range o.pending {
 			if l == 0 {
 				ackWait = o.ackWait(0)
 			} else {
-				bi := int(o.rdc[p.Sequence])
+				bi := int(o.rdc[seq])
 				if bi < 0 {
 					bi = 0
 				} else if bi >= l {

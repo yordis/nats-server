@@ -10141,16 +10141,22 @@ func TestJetStreamConsumerNotInactiveDuringAckWaitBackoff(t *testing.T) {
 
 		_, err := js.AddStream(&nats.StreamConfig{
 			Name:     "TEST",
-			Subjects: []string{"foo"},
+			Subjects: []string{"foo.>"},
 			Replicas: replicas,
 		})
 		require_NoError(t, err)
 
-		_, err = js.Publish("foo", nil)
+		// Advance the stream sequence with some unrelated messages.
+		for range 5 {
+			_, err = js.Publish("foo.skip", nil)
+			require_NoError(t, err)
+		}
+		_, err = js.Publish("foo.match", nil)
 		require_NoError(t, err)
 
 		_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
 			Durable:           "CONSUMER",
+			FilterSubject:     "foo.match",
 			AckPolicy:         nats.AckExplicitPolicy,
 			Replicas:          replicas,
 			InactiveThreshold: 500 * time.Millisecond, // Pull mode adds up to 1 second randomly.
@@ -10164,7 +10170,7 @@ func TestJetStreamConsumerNotInactiveDuringAckWaitBackoff(t *testing.T) {
 		_, err = js.ConsumerInfo("TEST", "CONSUMER")
 		require_NoError(t, err)
 
-		sub, err := js.PullSubscribe(_EMPTY_, "CONSUMER", nats.BindStream("TEST"))
+		sub, err := js.PullSubscribe("foo.match", "CONSUMER", nats.BindStream("TEST"))
 		require_NoError(t, err)
 		defer sub.Drain()
 
