@@ -15,6 +15,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -796,4 +797,48 @@ func TestAuthProxyRequired(t *testing.T) {
 
 	s.Shutdown()
 	drainLog()
+}
+
+func TestAuthProxyCheckConnClosedDuringAuth(t *testing.T) {
+	pkp, err := nkeys.CreateUser()
+	require_NoError(t, err)
+	pub, err := pkp.PublicKey()
+	require_NoError(t, err)
+
+	o := DefaultOptions()
+	o.Proxies = &ProxiesConfig{Trusted: []*ProxyConfig{{Key: pub}}}
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	c, _, _ := newClientForServer(s)
+	defer c.close()
+
+	// Sign the connection's nonce as the trusted proxy would and store
+	// the signature in the connect options.
+	c.mu.Lock()
+	sig, err := pkp.Sign(c.nonce)
+	if err == nil {
+		c.opts.ProxySig = base64.RawURLEncoding.EncodeToString(sig)
+	}
+	c.mu.Unlock()
+	require_NoError(t, err)
+
+	// Simulate the connection being closed concurrently (write error,
+	// shutdown, kick, etc..) while the readLoop is still authenticating:
+	// closeConnection invokes removeClient, which tries to remove the
+	// connection from s.proxiedConns before proxyCheck registered it.
+	c.client.closeConnection(ClientClosed)
+
+	// Now run proxyCheck as checkAuthentication would on the readLoop.
+	proxied, ok := s.proxyCheck(c.client, s.getOpts())
+	require_True(t, proxied)
+	require_True(t, ok)
+
+	// Since the connection is already closed and removeClient already ran,
+	// the client must not have been registered in s.proxiedConns, since
+	// nothing would ever remove it.
+	s.mu.RLock()
+	conns := s.proxiedConns[pub]
+	s.mu.RUnlock()
+	require_Len(t, len(conns), 0)
 }
