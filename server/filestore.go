@@ -10463,6 +10463,20 @@ func (fs *fileStore) compact(seq uint64) (purged uint64, rerr error) {
 			nbuf := getMsgBlockBuf(len(buf))
 			nbuf = append(nbuf, buf...)
 			smb.closeFDsLockedNoCheck()
+			// Check for compression.
+			if smb.cmp != NoCompression && len(nbuf) > 0 {
+				originalSize := len(nbuf)
+				if nbuf, err = smb.cmp.Compress(nbuf); err != nil {
+					smb.mu.Unlock()
+					fs.mu.Unlock()
+					return purged, err
+				}
+				meta := &CompressionInfo{
+					Algorithm:    smb.cmp,
+					OriginalSize: uint64(originalSize),
+				}
+				nbuf = append(meta.MarshalMetadata(), nbuf...)
+			}
 			// Check for encryption.
 			if smb.bek != nil && len(nbuf) > 0 {
 				// Recreate to reset counter.
@@ -10475,13 +10489,6 @@ func (fs *fileStore) compact(seq uint64) (purged uint64, rerr error) {
 				// For future writes make sure to set smb.bek to keep counter correct.
 				smb.bek = bek
 				smb.bek.XORKeyStream(nbuf, nbuf)
-			}
-			// Recompress if necessary (smb.cmp contains the algorithm used when
-			// the block was loaded from disk, or defaults to NoCompression if not)
-			if nbuf, err = smb.cmp.Compress(nbuf); err != nil {
-				smb.mu.Unlock()
-				fs.mu.Unlock()
-				return purged, err
 			}
 
 			// We will write to a new file and mv/rename it in case of failure.

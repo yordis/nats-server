@@ -12525,6 +12525,73 @@ func TestFileStoreCompactFullyResetsFirstAndLastSeq(t *testing.T) {
 	})
 }
 
+func TestFileStoreCompactHeadReclaimRecompressedBlock(t *testing.T) {
+	testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
+		fcfg.BlockSize = 8 * 1024 * 1024 // Large so everything lands in one block.
+		cfg := StreamConfig{Name: "zzz", Subjects: []string{"zzz"}, Storage: FileStorage}
+		fs, err := newFileStoreWithCreated(fcfg, cfg, time.Now(), prf(&fcfg), nil)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		// Use incompressible (random) payloads so the on-disk rbytes stays above
+		// compactMinimum (2MB) even after S2 compression.
+		const num = 50
+		msgs := make([][]byte, num)
+		for i := range num {
+			m := make([]byte, 64*1024)
+			_, err = crand.Read(m)
+			require_NoError(t, err)
+			msgs[i] = m
+			_, _, err = fs.StoreMsg("zzz", nil, m, 0)
+			require_NoError(t, err)
+		}
+
+		// Force the active block to be recompressed on disk so that smb.cmp
+		// matches the configured algorithm, emulating the post-rotation state
+		// that triggers the head-reclaim path. For a NoCompression store this is
+		// a no-op and smb.cmp stays NoCompression.
+		fs.mu.RLock()
+		smb := fs.lmb
+		fs.mu.RUnlock()
+		smb.mu.Lock()
+		require_NoError(t, smb.recompressOnDiskIfNeeded())
+		cmp := smb.cmp
+		rbytes := smb.rbytes
+		smb.mu.Unlock()
+		require_Equal(t, cmp, fcfg.Compression)
+		require_True(t, rbytes > compactMinimum)
+
+		// Compact away most of the block, leaving the tail. This drives the
+		// head-space reclaim branch which rewrites the block on disk.
+		_, err = fs.Compact(num - 5)
+		require_NoError(t, err)
+
+		// Sanity check we can still read the remaining messages in-process.
+		var smv StoreMsg
+		for seq := uint64(num - 5); seq <= num; seq++ {
+			sm, err := fs.LoadMsg(seq, &smv)
+			require_NoError(t, err)
+			require_True(t, bytes.Equal(sm.msg, msgs[seq-1]))
+		}
+
+		// Now reload from disk: this exercises decompressIfNeeded, which is where
+		// a missing CompressionInfo header would surface as a corrupt block.
+		require_NoError(t, fs.Stop())
+		fs, err = newFileStoreWithCreated(fcfg, cfg, time.Now(), prf(&fcfg), nil)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		var state StreamState
+		fs.FastState(&state)
+		require_Equal(t, state.Msgs, 6)
+		for seq := uint64(num - 5); seq <= num; seq++ {
+			sm, err := fs.LoadMsg(seq, &smv)
+			require_NoError(t, err)
+			require_True(t, bytes.Equal(sm.msg, msgs[seq-1]))
+		}
+	})
+}
+
 func TestFileStoreDoesntRebuildSubjectStateWithNoTrack(t *testing.T) {
 	testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
 		fs, err := newFileStoreWithCreated(fcfg, StreamConfig{Name: "zzz", Storage: FileStorage}, time.Now(), prf(&fcfg), nil)
