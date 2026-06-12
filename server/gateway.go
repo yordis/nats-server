@@ -956,8 +956,9 @@ func (s *Server) createGateway(cfg *gatewayCfg, url *url.URL, conn net.Conn) {
 // Builds and sends the CONNECT protocol for a gateway.
 // Client lock held on entry.
 func (c *client) sendGatewayConnect(opts *Options) {
-	// FIXME: This can race with updateRemotesTLSConfig
+	c.gw.cfg.RLock()
 	tlsRequired := c.gw.cfg.TLSConfig != nil
+	c.gw.cfg.RUnlock()
 	url := c.gw.connectURL
 	c.gw.connectURL = nil
 	var user, pass string
