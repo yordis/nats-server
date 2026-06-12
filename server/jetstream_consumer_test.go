@@ -3510,6 +3510,48 @@ func TestJetStreamConsumerAckAck(t *testing.T) {
 	testAck(AckTerm)
 }
 
+func TestJetStreamConsumerAckV1NameWithPercent(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	mname := "TE%ST"
+	mset, err := s.globalAccount().addStream(&StreamConfig{Name: mname, Storage: MemoryStorage})
+	require_NoError(t, err)
+	defer mset.delete()
+
+	o, err := mset.addConsumer(&ConsumerConfig{Durable: "wor%ker", AckPolicy: AckExplicit})
+	require_NoError(t, err)
+	defer o.delete()
+
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+
+	sendStreamMsg(t, nc, mname, "Hello World!")
+
+	// The pull subject must contain the real names so a client deriving it
+	// from the stream and consumer names reaches the consumer.
+	nextSubj := fmt.Sprintf(JSApiRequestNextT, "TE%ST", "wor%ker")
+	require_Equal(t, o.requestNextMsgSubject(), nextSubj)
+
+	m, err := nc.Request(nextSubj, nil, time.Second)
+	require_NoError(t, err)
+
+	// The reply subject must contain the real names, not a %-escaped form.
+	require_True(t, strings.HasPrefix(m.Reply, "$JS.ACK.TE%ST.wor%ker."))
+
+	// Ack and make sure the server "ack's" the ack, meaning the consumer's
+	// ack subscription actually matches the rendered reply subject.
+	_, err = nc.Request(m.Reply, AckAck, time.Second)
+	require_NoError(t, err)
+
+	checkFor(t, time.Second, 25*time.Millisecond, func() error {
+		if info := o.info(); info.NumAckPending != 0 {
+			return fmt.Errorf("expected no ack pending, got %d", info.NumAckPending)
+		}
+		return nil
+	})
+}
+
 func TestJetStreamConsumerRateLimit(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
