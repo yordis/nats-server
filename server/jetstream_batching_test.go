@@ -1745,6 +1745,52 @@ func TestJetStreamAtomicBatchPublishStageAndCommit(t *testing.T) {
 	}
 }
 
+func TestJetStreamCounterStagingDoesNotCorruptCommittedTotal(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+
+	_, err := jsStreamCreate(t, nc, &StreamConfig{
+		Name:               "TEST",
+		Storage:            MemoryStorage,
+		AllowAtomicPublish: true,
+		Subjects:           []string{"foo"},
+	})
+	require_NoError(t, err)
+
+	mset, err := s.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+
+	// Committed total of 2, built via Add so the big.Int has spare backing-array
+	// capacity that a shallow copy would share (and an in-place Add corrupt).
+	committed := new(big.Int)
+	committed.Add(big.NewInt(1), big.NewInt(1))
+	committedSources := CounterSources{"S1": {"foo": "2"}}
+	mset.clusteredCounterTotal = map[string]*msgCounterRunningTotal{
+		"foo": {total: committed, sources: committedSources, ops: 1},
+	}
+
+	// Stage an increment without committing the diff; this must not mutate the
+	// committed total.
+	hdr := genHeader(nil, JSMessageIncr, "3")
+	hdr = genHeader(hdr, JSStreamSource, "S1 1 > > foo")
+	msg := []byte(`{"val":"5"}`)
+	diff := &batchStagedDiff{}
+	mset.clMu.Lock()
+	_, _, _, _, err = checkMsgHeadersPreClusteredProposal(diff, mset, "foo", "foo", hdr, msg, true, "TEST", nil, false, false, false, true, false, DiscardOld, false, -1, -1, -1, -1)
+	mset.clMu.Unlock()
+	require_NoError(t, err)
+
+	// Staged total reflects the increment (2+3=5).
+	require_Equal(t, diff.counter["foo"].total.String(), "5")
+	// Committed total and sources are untouched.
+	require_Equal(t, mset.clusteredCounterTotal["foo"].total.String(), "2")
+	require_Equal(t, mset.clusteredCounterTotal["foo"].ops, 1)
+	require_Equal(t, mset.clusteredCounterTotal["foo"].sources["S1"]["foo"], "2")
+}
+
 func TestJetStreamAtomicBatchPublishHighLevelRollback(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
