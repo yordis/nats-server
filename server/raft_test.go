@@ -169,6 +169,26 @@ func TestNRGAppendEntryDecodeTruncatedEntryLength(t *testing.T) {
 	require_Error(t, err, errBadAppendEntry)
 }
 
+func TestNRGPeerStateDecodeTruncated(t *testing.T) {
+	ps := &peerState{knownPeers: []string{"12345678", "abcdefgh"}, clusterSize: 2}
+	buf := encodePeerState(ps)
+
+	// Sanity check the round trip.
+	dps, err := decodePeerState(buf)
+	require_NoError(t, err)
+	require_Equal(t, len(dps.knownPeers), 2)
+	require_Equal(t, dps.clusterSize, 2)
+
+	// Header claims one peer but only a partial id (idLen-5 bytes) follows.
+	// len == cap so the partial id can not be read past the slice.
+	truncated := make([]byte, 8+idLen-5)
+	le := binary.LittleEndian
+	le.PutUint32(truncated[0:], 1)
+	le.PutUint32(truncated[4:], 1)
+	_, err = decodePeerState(truncated)
+	require_Error(t, err, errCorruptPeers)
+}
+
 func TestNRGRecoverFromFollowingNoLeader(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
