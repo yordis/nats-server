@@ -3424,6 +3424,8 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 		a.extAuth.AuthUsers.Add(ac.Authorization.AuthUsers...)
 		a.extAuth.AllowedAccounts.Add(ac.Authorization.AllowedAccounts...)
 		a.extAuth.XKey = ac.Authorization.XKey
+	} else {
+		a.extAuth = nil
 	}
 
 	// Reset exports and imports here.

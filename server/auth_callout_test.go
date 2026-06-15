@@ -395,6 +395,42 @@ func TestAuthCalloutBasics(t *testing.T) {
 	}
 }
 
+func TestAuthCalloutUpdateAccountClaimsClearsExternalAuthorization(t *testing.T) {
+	opts := defaultServerOptions
+	s := New(&opts)
+	defer s.Shutdown()
+
+	_, authAccPub := createKey(t)
+	_, authUserPub := createKey(t)
+	_, allowedAccPub := createKey(t)
+	_, deniedAccPub := createKey(t)
+
+	authAcc, err := s.RegisterAccount(authAccPub)
+	require_NoError(t, err)
+
+	claim := jwt.NewAccountClaims(authAccPub)
+	claim.Name = "AUTH"
+	claim.EnableExternalAuthorization(authUserPub)
+	claim.Authorization.AllowedAccounts.Add(allowedAccPub)
+	claim.Authorization.XKey = "test-xkey"
+	s.UpdateAccountClaims(authAcc, claim)
+
+	require_True(t, authAcc.hasExternalAuth())
+	require_True(t, authAcc.isExternalAuthUser(authUserPub))
+	require_True(t, authAcc.isAllowedAcount(allowedAccPub))
+	require_False(t, authAcc.isAllowedAcount(deniedAccPub))
+	require_Equal(t, authAcc.externalAuthXKey(), "test-xkey")
+
+	claim = jwt.NewAccountClaims(authAccPub)
+	claim.Name = "AUTH"
+	s.UpdateAccountClaims(authAcc, claim)
+
+	require_False(t, authAcc.hasExternalAuth())
+	require_False(t, authAcc.isExternalAuthUser(authUserPub))
+	require_False(t, authAcc.isAllowedAcount(allowedAccPub))
+	require_Equal(t, authAcc.externalAuthXKey(), _EMPTY_)
+}
+
 func TestAuthCalloutMQTTJwtPassedInConnectOptions(t *testing.T) {
 	storeDir := t.TempDir()
 	conf := fmt.Sprintf(`
