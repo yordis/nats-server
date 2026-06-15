@@ -4788,7 +4788,7 @@ func decodePeerState(buf []byte) (*peerState, error) {
 	expectedPeers := int(le.Uint32(buf[4:]))
 	buf = buf[8:]
 	ri := 0
-	for i, n := 0, expectedPeers; i < n && ri < len(buf); i++ {
+	for i, n := 0, expectedPeers; i < n && ri+idLen <= len(buf); i++ {
 		ps.knownPeers = append(ps.knownPeers, string(buf[ri:ri+idLen]))
 		ri += idLen
 	}
