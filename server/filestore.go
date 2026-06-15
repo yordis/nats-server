@@ -10461,6 +10461,8 @@ func (fs *fileStore) compact(seq uint64) (purged uint64, rerr error) {
 			buf := smb.cache.buf[moff:]
 			// Don't reuse, copy to new recycled buf.
 			nbuf := getMsgBlockBuf(len(buf))
+			// Recycle our nbuf when we are done.
+			defer recycleMsgBlockBuf(nbuf)
 			nbuf = append(nbuf, buf...)
 			smb.closeFDsLockedNoCheck()
 			// Check for compression.
