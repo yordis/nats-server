@@ -14461,3 +14461,24 @@ loop:
 			n, gotSeqVal.Load(), corrupt, subjects[gotSeqVal.Load()-1])
 	}
 }
+
+func TestFileStoreMultiLastSeqsDoesNotReorderConfigSubjects(t *testing.T) {
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: t.TempDir()},
+		StreamConfig{Name: "zzz", Subjects: []string{"orders.*", "billing.*"}, Storage: FileStorage})
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	_, _, err = fs.StoreMsg("orders.1", nil, []byte("x"), 0)
+	require_NoError(t, err)
+	_, _, err = fs.StoreMsg("billing.1", nil, []byte("x"), 0)
+	require_NoError(t, err)
+
+	// Filter count == subject count drives the filterIsAll path.
+	_, err = fs.MultiLastSeqs([]string{"orders.*", "billing.*"}, 0, 0)
+	require_NoError(t, err)
+
+	// The advertised config subjects must keep their original order.
+	require_Equal(t, fs.cfg.Subjects[0], "orders.*")
+	require_Equal(t, fs.cfg.Subjects[1], "billing.*")
+}

@@ -1770,3 +1770,22 @@ func Benchmark_MemStoreLoadNextMsgFiltered(b *testing.B) {
 		})
 	}
 }
+
+func TestMemStoreMultiLastSeqsDoesNotReorderConfigSubjects(t *testing.T) {
+	subjects := []string{"orders.*", "billing.*"}
+	ms, err := newMemStore(&StreamConfig{Name: "zzz", Storage: MemoryStorage, Subjects: subjects})
+	require_NoError(t, err)
+
+	_, _, err = ms.StoreMsg("orders.1", nil, []byte("x"), 0)
+	require_NoError(t, err)
+	_, _, err = ms.StoreMsg("billing.1", nil, []byte("x"), 0)
+	require_NoError(t, err)
+
+	// Filter count == subject count drives the filterIsAll path.
+	_, err = ms.MultiLastSeqs([]string{"orders.*", "billing.*"}, 0, 0)
+	require_NoError(t, err)
+
+	// The advertised config subjects must keep their original order.
+	require_Equal(t, ms.cfg.Subjects[0], "orders.*")
+	require_Equal(t, ms.cfg.Subjects[1], "billing.*")
+}

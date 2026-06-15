@@ -3795,10 +3795,11 @@ func (fs *fileStore) filterIsAll(filters []string) bool {
 		return false
 	}
 	// Sort so we can compare.
+	subjects := copyStrings(fs.cfg.Subjects)
 	slices.Sort(filters)
-	slices.Sort(fs.cfg.Subjects)
+	slices.Sort(subjects)
 	for i, subj := range filters {
-		if !subjectIsSubsetMatch(fs.cfg.Subjects[i], subj) {
+		if !subjectIsSubsetMatch(subjects[i], subj) {
 			return false
 		}
 	}
