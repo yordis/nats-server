@@ -2244,6 +2244,160 @@ func TestJetStreamConsumerUnpin(t *testing.T) {
 	}
 }
 
+func TestJetStreamConsumerPinnedStandbyMaxBytesNotEroded(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	mset, err := s.globalAccount().addStream(&StreamConfig{
+		Name:      "TEST",
+		Subjects:  []string{"foo.>"},
+		Retention: LimitsPolicy,
+	})
+	require_NoError(t, err)
+
+	_, err = mset.addConsumer(&ConsumerConfig{
+		Durable:        "C",
+		FilterSubject:  "foo.>",
+		PriorityGroups: []string{"A"},
+		PriorityPolicy: PriorityPinnedClient,
+		AckPolicy:      AckExplicit,
+		PinnedTTL:      30 * time.Second,
+	})
+	require_NoError(t, err)
+
+	const nextSubj = "$JS.API.CONSUMER.MSG.NEXT.TEST.C"
+
+	// Pinned client A: large batch so it remains the pinned holder throughout.
+	reqA, _ := json.Marshal(JSApiConsumerGetNextRequest{
+		Batch:         100000,
+		Expires:       30 * time.Second,
+		PriorityGroup: PriorityGroup{Group: "A"},
+	})
+	subA, err := nc.SubscribeSync("RA")
+	require_NoError(t, err)
+	defer subA.Unsubscribe()
+	require_NoError(t, nc.PublishRequest(nextSubj, "RA", reqA))
+
+	// Standby client B: no pin id and a small max_bytes budget. It will be
+	// cycled on every delivery to A and must not have its budget eroded.
+	reqB, _ := json.Marshal(JSApiConsumerGetNextRequest{
+		Batch:         100,
+		MaxBytes:      500,
+		Expires:       30 * time.Second,
+		PriorityGroup: PriorityGroup{Group: "A"},
+	})
+	subB, err := nc.SubscribeSync("RB")
+	require_NoError(t, err)
+	defer subB.Unsubscribe()
+	require_NoError(t, nc.PublishRequest(nextSubj, "RB", reqB))
+
+	// Wait for both requests to register as waiting.
+	o := mset.lookupConsumer("C")
+	require_NotNil(t, o)
+	checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+		o.mu.RLock()
+		defer o.mu.RUnlock()
+		if got := o.waiting.len(); got != 2 {
+			return fmt.Errorf("expected 2 waiting requests, got %d", got)
+		}
+		return nil
+	})
+
+	// Publish many messages; all should be delivered to pinned client A.
+	payload := make([]byte, 200)
+	for range 50 {
+		_, err = js.Publish("foo.bar", payload)
+		require_NoError(t, err)
+	}
+
+	// Drain A's deliveries.
+	for {
+		if _, err := subA.NextMsg(250 * time.Millisecond); err != nil {
+			break
+		}
+	}
+
+	// B must NOT have been terminated with a 409. In the buggy code its budget
+	// is eroded by A's traffic and it receives a spurious 409.
+	if msg, err := subB.NextMsg(500 * time.Millisecond); err == nil && msg != nil {
+		t.Fatalf("standby request B received an unexpected response (status=%q); its max_bytes budget was eroded by another client's traffic",
+			msg.Header.Get("Status"))
+	}
+}
+
+func TestJetStreamConsumerPinnedMaxBytesRejectDoesNotOrphanPin(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	mset, err := s.globalAccount().addStream(&StreamConfig{
+		Name:      "TEST",
+		Subjects:  []string{"foo.>"},
+		Retention: LimitsPolicy,
+	})
+	require_NoError(t, err)
+
+	_, err = mset.addConsumer(&ConsumerConfig{
+		Durable:        "C",
+		FilterSubject:  "foo.>",
+		PriorityGroups: []string{"A"},
+		PriorityPolicy: PriorityPinnedClient,
+		AckPolicy:      AckExplicit,
+		// Long TTL so the only way the consumer can recover is by correctly
+		// releasing the pin, not by waiting for the timer to fire.
+		PinnedTTL: 30 * time.Second,
+	})
+	require_NoError(t, err)
+
+	const nextSubj = "$JS.API.CONSUMER.MSG.NEXT.TEST.C"
+
+	// Publish a message that is larger than client A's max_bytes budget.
+	_, err = js.Publish("foo.bar", make([]byte, 200))
+	require_NoError(t, err)
+
+	// Client A claims the pin, but its max_bytes is too small for the pending message.
+	reqA, err := json.Marshal(JSApiConsumerGetNextRequest{
+		Batch:         1,
+		MaxBytes:      10,
+		Expires:       30 * time.Second,
+		PriorityGroup: PriorityGroup{Group: "A"},
+	})
+	require_NoError(t, err)
+	subA, err := nc.SubscribeSync("RA")
+	require_NoError(t, err)
+	defer subA.Unsubscribe()
+	require_NoError(t, nc.PublishRequest(nextSubj, "RA", reqA))
+
+	// A must receive a 409 for exceeding max bytes.
+	msgA, err := subA.NextMsg(time.Second)
+	require_NoError(t, err)
+	require_Equal(t, msgA.Header.Get("Status"), "409")
+
+	// Client B arrives and should now claim the pin.
+	reqB, err := json.Marshal(JSApiConsumerGetNextRequest{
+		Batch:         1,
+		Expires:       30 * time.Second,
+		PriorityGroup: PriorityGroup{Group: "A"},
+	})
+	require_NoError(t, err)
+	subB, err := nc.SubscribeSync("RB")
+	require_NoError(t, err)
+	defer subB.Unsubscribe()
+	require_NoError(t, nc.PublishRequest(nextSubj, "RB", reqB))
+
+	msgB, err := subB.NextMsg(time.Second)
+	require_NoError(t, err)
+	// Must be the actual message, not a status response.
+	require_Equal(t, msgB.Subject, "foo.bar")
+	require_Equal(t, msgB.Header.Get("Status"), "")
+	require_Equal(t, len(msgB.Data), 200)
+}
+
 func TestJetStreamConsumerWithPriorityGroups(t *testing.T) {
 	single := RunBasicJetStreamServer(t)
 	defer single.Shutdown()
@@ -10141,16 +10295,22 @@ func TestJetStreamConsumerNotInactiveDuringAckWaitBackoff(t *testing.T) {
 
 		_, err := js.AddStream(&nats.StreamConfig{
 			Name:     "TEST",
-			Subjects: []string{"foo"},
+			Subjects: []string{"foo.>"},
 			Replicas: replicas,
 		})
 		require_NoError(t, err)
 
-		_, err = js.Publish("foo", nil)
+		// Advance the stream sequence with some unrelated messages.
+		for range 5 {
+			_, err = js.Publish("foo.skip", nil)
+			require_NoError(t, err)
+		}
+		_, err = js.Publish("foo.match", nil)
 		require_NoError(t, err)
 
 		_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
 			Durable:           "CONSUMER",
+			FilterSubject:     "foo.match",
 			AckPolicy:         nats.AckExplicitPolicy,
 			Replicas:          replicas,
 			InactiveThreshold: 500 * time.Millisecond, // Pull mode adds up to 1 second randomly.
@@ -10164,7 +10324,7 @@ func TestJetStreamConsumerNotInactiveDuringAckWaitBackoff(t *testing.T) {
 		_, err = js.ConsumerInfo("TEST", "CONSUMER")
 		require_NoError(t, err)
 
-		sub, err := js.PullSubscribe(_EMPTY_, "CONSUMER", nats.BindStream("TEST"))
+		sub, err := js.PullSubscribe("foo.match", "CONSUMER", nats.BindStream("TEST"))
 		require_NoError(t, err)
 		defer sub.Drain()
 
