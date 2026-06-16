@@ -3551,11 +3551,12 @@ func (n *raft) applyCommit(index uint64) error {
 		delete(n.acks, index)
 	}
 
+	if index <= n.papplied {
+		return nil
+	}
+
 	ae := n.pae[index]
 	if ae == nil {
-		if index < n.papplied {
-			return nil
-		}
 		var err error
 		if ae, err = n.loadEntry(index); err != nil {
 			if err != ErrStoreClosed && err != ErrStoreEOF {
