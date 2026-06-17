@@ -6267,6 +6267,55 @@ func TestNRGPausingQuorumCancelsCatchup(t *testing.T) {
 	t.Run("AlreadyPaused", func(t *testing.T) { test(t, true) })
 }
 
+func TestNRGApplyCommitDoesNotResetWALAtSnapshotBoundary(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entry := []*Entry{newEntry(EntryNormal, esm)}
+
+	// Build a WAL with 3 entries.
+	ae1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entry})
+	ae2 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 1, entries: entry})
+	ae3 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 2, entries: entry})
+	n.processAppendEntry(ae1, n.aesub)
+	n.processAppendEntry(ae2, n.aesub)
+	n.processAppendEntry(ae3, n.aesub)
+	require_Equal(t, n.pindex, 3)
+	require_Equal(t, n.commit, 0)
+
+	// Install a snapshot past our commit, not overwriting commit here.
+	snap := &snapshot{
+		lastTerm:  1,
+		lastIndex: 2,
+		peerstate: encodePeerState(&peerState{n.peerNames(), n.csz, n.extSt}),
+	}
+	n.Lock()
+	require_NoError(t, n.installSnapshot(snap))
+	n.Unlock()
+	require_Equal(t, n.papplied, 2)
+	require_Equal(t, n.commit, 0)
+
+	var before StreamState
+	n.wal.FastState(&before)
+	require_Equal(t, before.FirstSeq, 3)
+	require_Equal(t, before.Msgs, 1)
+
+	// A heartbeat advances commit through the snapshot boundary. The apply loop
+	// should skip entries that are already compacted away.
+	aeHeartbeat := encode(t, &appendEntry{leader: nats0, term: 1, commit: 3, pterm: 1, pindex: 3, entries: nil})
+	n.processAppendEntry(aeHeartbeat, n.aesub)
+
+	// The WAL must be intact: entry 3 still present, no reset to [0,0].
+	var after StreamState
+	n.wal.FastState(&after)
+	require_Equal(t, after.FirstSeq, 3)
+	require_Equal(t, after.Msgs, 1)
+	// And we should have applied past the snapshot boundary up to the new commit.
+	require_Equal(t, n.commit, 3)
+}
+
 func TestNRGProcessAppendEntryTermMismatchDoesNotRegressCommit(t *testing.T) {
 	n, cleanup := initSingleMemRaftNode(t)
 	defer cleanup()
