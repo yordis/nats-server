@@ -6854,7 +6854,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 
 	// Skip msg here.
 	if noInterest {
-		mset.lseq, _ = store.SkipMsg(0)
+		mset.lseq, _ = store.SkipMsgNoInterest(0)
 		mset.lmsgId = msgId
 		// If we have a msgId make sure to save.
 		if msgId != _EMPTY_ {

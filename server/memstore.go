@@ -368,9 +368,16 @@ func (ms *memStore) StoreMsg(subj string, hdr, msg []byte, ttl int64) (uint64, i
 
 // SkipMsg will use the next sequence number but not store anything.
 func (ms *memStore) SkipMsg(seq uint64) (uint64, error) {
-	// Grab time.
-	now := time.Unix(0, ats.AccessTime()).UTC()
+	return ms.skipMsg(seq, false)
+}
 
+// SkipMsgNoInterest will use the next sequence number but not store anything.
+// Unlike SkipMsg it also advances LastTime, which is used for Interest retention.
+func (ms *memStore) SkipMsgNoInterest(seq uint64) (uint64, error) {
+	return ms.skipMsg(seq, true)
+}
+
+func (ms *memStore) skipMsg(seq uint64, noInterest bool) (uint64, error) {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 
@@ -383,7 +390,10 @@ func (ms *memStore) SkipMsg(seq uint64) (uint64, error) {
 	}
 
 	ms.state.LastSeq = seq
-	ms.state.LastTime = now
+	// Only update time if not already set or for Interest retention.
+	if noInterest || ms.state.LastTime.IsZero() {
+		ms.state.LastTime = time.Unix(0, ats.AccessTime()).UTC()
+	}
 	if ms.state.Msgs == 0 {
 		ms.state.FirstSeq = seq + 1
 		ms.state.FirstTime = time.Time{}
@@ -395,9 +405,6 @@ func (ms *memStore) SkipMsg(seq uint64) (uint64, error) {
 
 // Skip multiple msgs.
 func (ms *memStore) SkipMsgs(seq uint64, num uint64) error {
-	// Grab time.
-	now := time.Unix(0, ats.AccessTime()).UTC()
-
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 
@@ -411,7 +418,10 @@ func (ms *memStore) SkipMsgs(seq uint64, num uint64) error {
 	lseq := seq + num - 1
 
 	ms.state.LastSeq = lseq
-	ms.state.LastTime = now
+	// Only update time if not already set.
+	if ms.state.LastTime.IsZero() {
+		ms.state.LastTime = time.Unix(0, ats.AccessTime()).UTC()
+	}
 	if ms.state.Msgs == 0 {
 		ms.state.FirstSeq, ms.state.FirstTime = lseq+1, time.Time{}
 	} else {
