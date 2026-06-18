@@ -6609,6 +6609,292 @@ func TestJetStreamClusterMetaRecoveryUpdatesDeletesConsumers(t *testing.T) {
 	require_Len(t, len(ru.updateConsumers), 0)
 }
 
+func TestJetStreamClusterMetaRecoverySnapshotReconcilesStagedUpdates(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	ml := c.leader()
+	require_NotNil(t, ml)
+	js := ml.getJetStream()
+
+	// Helpers to build the recovery log entries that stage operations.
+	addStream := func(name string) *Entry {
+		return &Entry{EntryNormal, encodeAddStreamAssignment(&streamAssignment{
+			Client: &ClientInfo{Account: globalAccountName},
+			Config: &StreamConfig{Name: name, Storage: FileStorage},
+		})}
+	}
+	updateStream := func(name string) *Entry {
+		return &Entry{EntryNormal, encodeUpdateStreamAssignment(&streamAssignment{
+			Client: &ClientInfo{Account: globalAccountName},
+			Config: &StreamConfig{Name: name, Storage: FileStorage},
+		})}
+	}
+	addConsumer := func(stream, name string) *Entry {
+		return &Entry{EntryNormal, encodeAddConsumerAssignment(&consumerAssignment{
+			Client: &ClientInfo{Account: globalAccountName}, Stream: stream, Name: name,
+			Config: &ConsumerConfig{Name: name},
+		})}
+	}
+	delConsumer := func(stream, name string) *Entry {
+		return &Entry{EntryNormal, encodeDeleteConsumerAssignment(&consumerAssignment{
+			Client: &ClientInfo{Account: globalAccountName}, Stream: stream, Name: name,
+			Config: &ConsumerConfig{Name: name},
+		})}
+	}
+
+	// snapStream describes a stream (and its consumers) present in the incoming compacted snapshot.
+	type snapStream struct {
+		name      string
+		consumers []string
+	}
+	encodeSnapshot := func(t *testing.T, streams ...snapStream) []*Entry {
+		t.Helper()
+		asa := map[string]*streamAssignment{}
+		for _, s := range streams {
+			cfg := &StreamConfig{Name: s.name, Storage: FileStorage}
+			cfgJSON, err := json.Marshal(cfg)
+			require_NoError(t, err)
+			sa := &streamAssignment{Client: &ClientInfo{Account: globalAccountName}, Config: cfg, ConfigJSON: cfgJSON}
+			for _, cn := range s.consumers {
+				if sa.consumers == nil {
+					sa.consumers = map[string]*consumerAssignment{}
+				}
+				ccfg := &ConsumerConfig{Name: cn}
+				ccfgJSON, err := json.Marshal(ccfg)
+				require_NoError(t, err)
+				sa.consumers[cn] = &consumerAssignment{
+					Client: &ClientInfo{Account: globalAccountName}, Stream: s.name, Name: cn,
+					Config: ccfg, ConfigJSON: ccfgJSON,
+				}
+			}
+			asa[s.name] = sa
+		}
+		snap, _, _, err := js.encodeMetaSnapshot(map[string]map[string]*streamAssignment{globalAccountName: asa})
+		require_NoError(t, err)
+		return []*Entry{{EntrySnapshot, snap}}
+	}
+
+	// Collect the names staged in each part of ru, sorted for stable comparison.
+	streamNames := func(m map[string]*streamAssignment) []string {
+		var out []string
+		for _, sa := range m {
+			out = append(out, sa.Config.Name)
+		}
+		slices.Sort(out)
+		return out
+	}
+	consumerNames := func(m map[string]map[string]*consumerAssignment) []string {
+		var out []string
+		for _, cs := range m {
+			for _, ca := range cs {
+				out = append(out, ca.Name)
+			}
+		}
+		slices.Sort(out)
+		return out
+	}
+	assertNames := func(t *testing.T, label string, got, want []string) {
+		t.Helper()
+		want = slices.Clone(want)
+		slices.Sort(want)
+		if !slices.Equal(got, want) {
+			t.Fatalf("%s: got %v, want %v", label, got, want)
+		}
+	}
+
+	for _, test := range []struct {
+		name string
+		// Entries staged during recovery, before the snapshot arrives.
+		entries []*Entry
+		// Streams (and their consumers) the compacted snapshot contains.
+		snapshot []snapStream
+		// Staged state expected after the entries, before the snapshot reconciles them.
+		preStreams   []string
+		preUpdates   []string
+		preConsumers []string
+		preRemoves   []string
+		// Staged state expected after the snapshot has reconciled the staged updates.
+		wantStreams   []string
+		wantUpdates   []string
+		wantConsumers []string
+		wantRemoves   []string
+	}{
+		{
+			// A stream staged for add that the snapshot omits is a phantom and must be dropped;
+			// a stream the snapshot contains is (re)staged as an add.
+			name:        "deleted stream",
+			entries:     []*Entry{addStream("TEST")},
+			snapshot:    []snapStream{{name: "KEEP"}},
+			preStreams:  []string{"TEST"},
+			wantStreams: []string{"KEEP"},
+		},
+		{
+			// When the stream itself is superseded, its staged consumer add (CA) and remove (CB)
+			// must be dropped along with it.
+			name: "deleted stream with consumers",
+			entries: []*Entry{
+				addStream("TEST"),
+				addConsumer("TEST", "CA"),
+				addConsumer("TEST", "CB"),
+				delConsumer("TEST", "CB"),
+			},
+			snapshot:     []snapStream{{name: "KEEP"}},
+			preStreams:   []string{"TEST"},
+			preConsumers: []string{"CA"},
+			preRemoves:   []string{"CB"},
+			wantStreams:  []string{"KEEP"},
+		},
+		{
+			// The stream survives, but a staged consumer (C2) the snapshot omits is a phantom and
+			// must be dropped; the consumer the snapshot still contains (C1) is kept.
+			name: "deleted consumer",
+			entries: []*Entry{
+				addStream("TEST"),
+				addConsumer("TEST", "C1"),
+				addConsumer("TEST", "C2"),
+			},
+			snapshot:      []snapStream{{name: "TEST", consumers: []string{"C1"}}},
+			preStreams:    []string{"TEST"},
+			preConsumers:  []string{"C1", "C2"},
+			wantStreams:   []string{"TEST"},
+			wantConsumers: []string{"C1"},
+		},
+		{
+			// Nothing is a phantom: every staged consumer is present in the snapshot, and the
+			// snapshot also (re)stages its own consumers (C2 here was not staged via an entry).
+			name: "snapshot adds consumer",
+			entries: []*Entry{
+				addStream("TEST"),
+				addConsumer("TEST", "C1"),
+			},
+			snapshot:      []snapStream{{name: "TEST", consumers: []string{"C1", "C2"}}},
+			preStreams:    []string{"TEST"},
+			preConsumers:  []string{"C1"},
+			wantStreams:   []string{"TEST"},
+			wantConsumers: []string{"C1", "C2"},
+		},
+		{
+			// Both paths at once: stream KEEP (and consumer KC) survive, while stream GONE (and
+			// its consumer GC) are superseded and dropped.
+			name: "mixed stream delete",
+			entries: []*Entry{
+				addStream("KEEP"),
+				addConsumer("KEEP", "KC"),
+				addStream("GONE"),
+				addConsumer("GONE", "GC"),
+			},
+			snapshot:      []snapStream{{name: "KEEP", consumers: []string{"KC"}}},
+			preStreams:    []string{"GONE", "KEEP"},
+			preConsumers:  []string{"GC", "KC"},
+			wantStreams:   []string{"KEEP"},
+			wantConsumers: []string{"KC"},
+		},
+		{
+			// An empty snapshot (all streams deleted) supersedes everything staged.
+			name: "empty snapshot",
+			entries: []*Entry{
+				addStream("TEST"),
+				addConsumer("TEST", "C1"),
+			},
+			snapshot:     nil,
+			preStreams:   []string{"TEST"},
+			preConsumers: []string{"C1"},
+		},
+		{
+			// A stream created and then updated during recovery is staged in both addStreams and
+			// updateStreams. When superseded, the addStreams loop must clear the updateStreams entry
+			// too (so the update is not later applied against a stream that no longer exists).
+			name: "added-and-updated stream",
+			entries: []*Entry{
+				addStream("TEST"),
+				updateStream("TEST"),
+			},
+			snapshot:    []snapStream{{name: "KEEP"}},
+			preStreams:  []string{"TEST"},
+			preUpdates:  []string{"TEST"},
+			wantStreams: []string{"KEEP"},
+		},
+		{
+			// A stream created and then updated during recovery is staged in both addStreams and
+			// updateStreams. When the snapshot keeps the stream it re-stages it as an add, which must
+			// clear the now-stale staged update. Otherwise recovery completion applies the add and then
+			// reapplies the older update (adds run before updates), rolling the stream config back away
+			// from the snapshot state.
+			name: "added-and-updated stream kept",
+			entries: []*Entry{
+				addStream("TEST"),
+				updateStream("TEST"),
+			},
+			snapshot:    []snapStream{{name: "TEST"}},
+			preStreams:  []string{"TEST"},
+			preUpdates:  []string{"TEST"},
+			wantStreams: []string{"TEST"},
+			// wantUpdates intentionally empty: the snapshot's re-add supersedes the stale staged update.
+		},
+		{
+			// A stream staged only in updateStreams (its add is outside this recovery batch) is
+			// reconciled by the dedicated updateStreams loop: when superseded it and its staged
+			// consumer ops are dropped. This is the path the addStreams loop does not cover.
+			name: "update-only stream",
+			entries: []*Entry{
+				updateStream("GONE"),
+				addConsumer("GONE", "GC"),
+			},
+			snapshot:     []snapStream{{name: "KEEP"}},
+			preUpdates:   []string{"GONE"},
+			preConsumers: []string{"GC"},
+			wantStreams:  []string{"KEEP"},
+		},
+		{
+			// A stream staged only via an update, that the snapshot keeps: the snapshot re-stages it as
+			// an add which supersedes the now-stale staged update (so it is not reapplied after the add
+			// at recovery completion). The phantom consumer under it (C2) is still dropped; C1 survives.
+			name: "update-only stream kept",
+			entries: []*Entry{
+				updateStream("TEST"),
+				addConsumer("TEST", "C1"),
+				addConsumer("TEST", "C2"),
+			},
+			snapshot:     []snapStream{{name: "TEST", consumers: []string{"C1"}}},
+			preUpdates:   []string{"TEST"},
+			preConsumers: []string{"C1", "C2"},
+			wantStreams:  []string{"TEST"},
+			// wantUpdates intentionally empty: the snapshot's re-add supersedes the stale staged update.
+			wantConsumers: []string{"C1"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// Need to be recovering so that we accumulate recoveryUpdates.
+			js.setMetaRecovering()
+			ru := &recoveryUpdates{
+				removeStreams:   make(map[string]*streamAssignment),
+				removeConsumers: make(map[string]map[string]*consumerAssignment),
+				addStreams:      make(map[string]*streamAssignment),
+				updateStreams:   make(map[string]*streamAssignment),
+				updateConsumers: make(map[string]map[string]*consumerAssignment),
+			}
+
+			// Stage the recovery entries, then verify what they staged (so the snapshot assertions
+			// below are not vacuously satisfied by entries that never staged anything).
+			_, _, err := js.applyMetaEntries(test.entries, ru)
+			require_NoError(t, err)
+			assertNames(t, "pre stream adds", streamNames(ru.addStreams), test.preStreams)
+			assertNames(t, "pre stream updates", streamNames(ru.updateStreams), test.preUpdates)
+			assertNames(t, "pre consumers", consumerNames(ru.updateConsumers), test.preConsumers)
+			assertNames(t, "pre removes", consumerNames(ru.removeConsumers), test.preRemoves)
+
+			// Apply the compacted snapshot, which reconciles the staged updates against it.
+			_, _, err = js.applyMetaEntries(encodeSnapshot(t, test.snapshot...), ru)
+			require_NoError(t, err)
+			assertNames(t, "stream adds", streamNames(ru.addStreams), test.wantStreams)
+			assertNames(t, "stream updates", streamNames(ru.updateStreams), test.wantUpdates)
+			assertNames(t, "consumer adds", consumerNames(ru.updateConsumers), test.wantConsumers)
+			assertNames(t, "consumer removes", consumerNames(ru.removeConsumers), test.wantRemoves)
+		})
+	}
+}
+
 func TestJetStreamClusterMetaRecoveryRecreateFileStreamAsMemory(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()

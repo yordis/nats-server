@@ -1516,6 +1516,8 @@ func (ru *recoveryUpdates) removeStream(sa *streamAssignment) {
 func (ru *recoveryUpdates) addStream(sa *streamAssignment) {
 	key := sa.recoveryKey()
 	ru.addStreams[key] = sa
+	// A fresh add supersedes any earlier staged update for this stream.
+	delete(ru.updateStreams, key)
 }
 
 func (ru *recoveryUpdates) updateStream(sa *streamAssignment) {
@@ -2121,6 +2123,44 @@ func (js *jetStream) applyMetaSnapshot(buf []byte, ru *recoveryUpdates, isRecove
 		}
 	}
 	js.mu.Unlock()
+
+	// Reconcile the staged recoveryUpdates against this snapshot. Any staged operations that the
+	// snapshot does not contain should be dropped, otherwise deleted assets could be revived.
+	if isRecovering && ru != nil {
+		supersededStream := func(sa *streamAssignment) bool {
+			acc := sa.Client.serviceAccount()
+			return streams[acc] == nil || streams[acc][sa.Config.Name] == nil
+		}
+		supersededConsumer := func(ca *consumerAssignment) bool {
+			nsa := streams[ca.Client.serviceAccount()][ca.Stream]
+			return nsa == nil || nsa.consumers[ca.Name] == nil
+		}
+		for key, sa := range ru.addStreams {
+			if supersededStream(sa) {
+				delete(ru.addStreams, key)
+				delete(ru.updateStreams, key)
+				delete(ru.updateConsumers, key)
+				delete(ru.removeConsumers, key)
+			}
+		}
+		for key, sa := range ru.updateStreams {
+			if supersededStream(sa) {
+				delete(ru.updateStreams, key)
+				delete(ru.updateConsumers, key)
+				delete(ru.removeConsumers, key)
+			}
+		}
+		for skey, consumers := range ru.updateConsumers {
+			for ckey, ca := range consumers {
+				if supersededConsumer(ca) {
+					delete(consumers, ckey)
+				}
+			}
+			if len(consumers) == 0 {
+				delete(ru.updateConsumers, skey)
+			}
+		}
+	}
 
 	// Do removals first.
 	for _, sa := range saDel {
