@@ -4988,6 +4988,12 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 		flags |= pmrIgnoreEmptyQueueFilter
 	}
 
+	// If this is a response service import that arrived via a route, allow delivery
+	// to route subscriptions. Service import replies use one-time _R_ subjects.
+	if isResponse && c.kind == ROUTER {
+		flags |= pmrAllowSendFromRouteToRoute
+	}
+
 	// We will be calling back into processMsgResults since we are now being called as a normal sub.
 	// We need to take care of the c.in.rts, so save off what is there and use a local version. We
 	// will put back what was there after.

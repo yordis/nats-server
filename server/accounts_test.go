@@ -4101,3 +4101,94 @@ func TestAccountServiceImportNoResponders(t *testing.T) {
 	_, err := nc.Request("foo", []byte("request"), 250*time.Millisecond)
 	require_Error(t, err, nats.ErrNoResponders)
 }
+
+// Test that service import replies are delivered when the requester's reply inbox
+// is subscribed on a different cluster node.
+func TestAccountServiceImportReplyDroppedAcrossClusterRoutes(t *testing.T) {
+	tmpl := `
+		server_name: %s
+		listen: 127.0.0.1:-1
+		cluster {
+			name: test
+			listen: 127.0.0.1:-1
+			%s
+		}
+		accounts {
+			A {
+				users = [{ user: a, password: a }]
+				imports = [{ service: { account: B, subject: svc } }]
+			}
+			B {
+				users = [{ user: b, password: b }]
+				exports = [{ service: svc, accounts: [A] }]
+			}
+		}
+	`
+	confA := createConfFile(t, []byte(fmt.Sprintf(tmpl, "node-A", "")))
+	srvA, optsA := RunServerWithConfig(confA)
+	defer srvA.Shutdown()
+
+	confB := createConfFile(t, []byte(fmt.Sprintf(tmpl, "node-B",
+		fmt.Sprintf(`routes = ["nats-route://127.0.0.1:%d"]`, optsA.Cluster.Port))))
+	srvB, _ := RunServerWithConfig(confB)
+	defer srvB.Shutdown()
+
+	checkClusterFormed(t, srvA, srvB)
+
+	// Responder on node-A, account B.
+	ncB := natsConnect(t, srvA.ClientURL(), nats.UserInfo("b", "b"))
+	defer ncB.Close()
+	natsSub(t, ncB, "svc", func(m *nats.Msg) { m.Respond([]byte("pong")) })
+	natsFlush(t, ncB)
+
+	// Wait for B's "svc" sub to propagate to node-B so it can route the request.
+	checkSubInterest(t, srvB, "B", "svc", time.Second)
+
+	// Subscriber on node-A, account A: explicit reply inbox.
+	// This subscription will be a ROUTE sub on node-B once it propagates.
+	ncSub := natsConnect(t, srvA.ClientURL(), nats.UserInfo("a", "a"))
+	defer ncSub.Close()
+	inbox := "_INBOX.xroute.reply"
+	replyCh := make(chan *nats.Msg, 1)
+	_, err := ncSub.Subscribe(inbox, func(m *nats.Msg) { replyCh <- m })
+	require_NoError(t, err)
+	natsFlush(t, ncSub)
+
+	// Wait for the inbox to appear as a ROUTE sub on node-B.
+	checkSubInterest(t, srvB, "A", inbox, time.Second)
+
+	// Publisher on node-B, account A: publish with explicit cross-node reply.
+	// The response service import on node-B receives the reply via route
+	// (c.kind==ROUTER) and must forward it back to the ROUTE sub for the inbox.
+	ncPub := natsConnect(t, srvB.ClientURL(), nats.UserInfo("a", "a"))
+	defer ncPub.Close()
+	err = ncPub.PublishMsg(&nats.Msg{Subject: "svc", Reply: inbox, Data: []byte("ping")})
+	require_NoError(t, err)
+
+	select {
+	case msg := <-replyCh:
+		require_Equal(t, string(msg.Data), "pong")
+	case <-time.After(3 * time.Second):
+		t.Fatal("reply not received — service import reply was dropped across cluster routes")
+	}
+
+	// Reverse: subscribe on node-B, publish from node-A.
+	ncSub2 := natsConnect(t, srvB.ClientURL(), nats.UserInfo("a", "a"))
+	defer ncSub2.Close()
+	inbox2 := "_INBOX.xroute.reply2"
+	replyCh2 := make(chan *nats.Msg, 1)
+	_, err = ncSub2.Subscribe(inbox2, func(m *nats.Msg) { replyCh2 <- m })
+	require_NoError(t, err)
+	natsFlush(t, ncSub2)
+	checkSubInterest(t, srvA, "A", inbox2, time.Second)
+
+	err = ncSub.PublishMsg(&nats.Msg{Subject: "svc", Reply: inbox2, Data: []byte("ping")})
+	require_NoError(t, err)
+
+	select {
+	case msg := <-replyCh2:
+		require_Equal(t, string(msg.Data), "pong")
+	case <-time.After(3 * time.Second):
+		t.Fatal("reverse reply not received — service import reply was dropped across cluster routes")
+	}
+}
