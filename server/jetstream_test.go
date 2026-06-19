@@ -41,6 +41,7 @@ import (
 	"time"
 
 	"github.com/nats-io/jwt/v2"
+	"github.com/nats-io/nats-server/v2/server/ats"
 	"github.com/nats-io/nats-server/v2/server/sysmem"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -24306,4 +24307,137 @@ func TestJetStreamJSAckSuffixCorruption(t *testing.T) {
 	receiver := dummyRouteClient()
 	receiver.route = &route{}
 	require_NoError(t, receiver.parse(frame))
+}
+
+func TestJetStreamMirrorDeliverByStartTime(t *testing.T) {
+	test := func(t *testing.T, storage nats.StorageType) {
+		s := RunBasicJetStreamServer(t)
+		defer s.Shutdown()
+
+		nc, js := jsClientConnect(t, s)
+		defer nc.Close()
+
+		_, err := js.AddStream(&nats.StreamConfig{
+			Name:     "S",
+			Subjects: []string{"data.>"},
+			Storage:  storage,
+		})
+		require_NoError(t, err)
+
+		// Seed source stream with old timestamps.
+		mset, err := s.globalAccount().lookupStream("S")
+		require_NoError(t, err)
+
+		base := time.Now().Add(-30 * 24 * time.Hour).UTC().Truncate(time.Minute)
+		payload := bytes.Repeat([]byte("A"), 64*1024)
+		const (
+			units = 200        // matching messages
+			gap   = uint64(20) // non-matching messages between each
+		)
+
+		var seq uint64
+		for i := range units {
+			seq++
+			ts := base.Add(time.Duration(i) * time.Minute).UnixNano()
+			require_NoError(t, mset.store.StoreRawMsg("data.one", nil, payload, seq, ts, 0, false))
+			for g := range gap {
+				seq++
+				fts := ts + int64(g+1)*int64(time.Second)
+				require_NoError(t, mset.store.StoreRawMsg("data.other", nil, []byte("O"), seq, fts, 0, false))
+			}
+		}
+		// Correct the stream's last sequence.
+		mset.mu.Lock()
+		mset.lseq = seq
+		mset.mu.Unlock()
+
+		// Create a filtered mirror.
+		_, err = js.AddStream(&nats.StreamConfig{
+			Name:    "M",
+			Storage: storage,
+			Mirror:  &nats.StreamSource{Name: "S", FilterSubject: "data.one"},
+		})
+		require_NoError(t, err)
+
+		// Wait for the mirror to backfill all matching messages.
+		checkFor(t, 30*time.Second, 100*time.Millisecond, func() error {
+			si, err := js.StreamInfo("M")
+			if err != nil {
+				return err
+			}
+			if si.State.Msgs != units {
+				return fmt.Errorf("mirror has %d msgs, want %d", si.State.Msgs, units)
+			}
+			return nil
+		})
+
+		// Request a start time ~2/3 into the data.
+		startIdx := 130
+		start := base.Add(time.Duration(startIdx) * time.Minute)
+
+		sub, err := js.PullSubscribe(_EMPTY_, _EMPTY_, nats.BindStream("M"), nats.StartTime(start))
+		require_NoError(t, err)
+		defer sub.Unsubscribe()
+
+		msgs, err := sub.Fetch(1, nats.MaxWait(time.Second))
+		require_NoError(t, err)
+		require_Equal(t, len(msgs), 1)
+		meta, err := msgs[0].Metadata()
+		require_NoError(t, err)
+		ts := meta.Timestamp.UTC()
+		require_True(t, ts.Equal(start))
+
+		// The mirror preserves source sequences. Pin the exact sequence so
+		// an over-skip (resolving too late) can't masquerade as a pass.
+		require_Equal(t, meta.Sequence.Stream, uint64(startIdx)*(gap+1)+1)
+	}
+
+	t.Run("Memory", func(t *testing.T) { test(t, nats.MemoryStorage) })
+	t.Run("File", func(t *testing.T) { test(t, nats.FileStorage) })
+}
+
+func TestJetStreamInterestStreamNoInterestSkipAdvancesLastTime(t *testing.T) {
+	test := func(t *testing.T, storage nats.StorageType) {
+		s := RunBasicJetStreamServer(t)
+		defer s.Shutdown()
+
+		nc, js := jsClientConnect(t, s)
+		defer nc.Close()
+
+		_, err := js.AddStream(&nats.StreamConfig{
+			Name:      "TEST",
+			Subjects:  []string{"foo"},
+			Storage:   storage,
+			Retention: nats.InterestPolicy,
+		})
+		require_NoError(t, err)
+
+		// A publish without interest still increases the stream sequence.
+		pubAck, err := js.Publish("foo", []byte("one"))
+		require_NoError(t, err)
+		require_Equal(t, pubAck.Sequence, uint64(1))
+
+		si, err := js.StreamInfo("TEST")
+		require_NoError(t, err)
+		require_Equal(t, si.State.Msgs, uint64(0))
+		require_Equal(t, si.State.LastSeq, uint64(1))
+		first := si.State.LastTime
+
+		// Let the clock advance past the access time service granularity.
+		time.Sleep(2 * ats.TickInterval)
+
+		// The second publish still has no interest, but should update both the sequence and time.
+		pubAck, err = js.Publish("foo", []byte("two"))
+		require_NoError(t, err)
+		require_Equal(t, pubAck.Sequence, uint64(2))
+
+		si, err = js.StreamInfo("TEST")
+		require_NoError(t, err)
+		require_Equal(t, si.State.Msgs, uint64(0))
+		require_Equal(t, si.State.LastSeq, uint64(2))
+		require_True(t, si.State.LastTime.After(first))
+	}
+
+	t.Run("Memory", func(t *testing.T) { test(t, nats.MemoryStorage) })
+	t.Run("File", func(t *testing.T) { test(t, nats.FileStorage) })
 }
