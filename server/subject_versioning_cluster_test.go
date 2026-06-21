@@ -11,6 +11,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !skip_store_tests && !skip_js_tests
+
 package server
 
 import (
@@ -109,8 +111,13 @@ func TestJetStreamClusterSubjectVersioningConcurrentPublish(t *testing.T) {
 		t.Helper()
 
 		versions := make([]uint64, 0, want)
+		seen := make(map[uint64]struct{}, want)
 		for _, result := range results {
 			if result.key == key {
+				if _, dup := seen[result.version]; dup {
+					t.Fatalf("duplicate subject version %d assigned for namespace %q", result.version, key)
+				}
+				seen[result.version] = struct{}{}
 				versions = append(versions, result.version)
 			}
 		}
@@ -212,6 +219,38 @@ func TestJetStreamClusterAtomicBatchSubjectVersioningExpectedVersionFirstOnly(t 
 	require_NotNil(t, nextAck.SubjectVersion)
 	require_Equal(t, *nextAck.SubjectVersion, uint64(1))
 	require_Equal(t, nextAck.SubjectVersionKey, "events.order.123")
+}
+
+func TestJetStreamClusterAtomicBatchSubjectVersioningRejectsReservedHeaders(t *testing.T) {
+	headers := []string{JSSubjectVersion, JSSubjectVersionKey}
+	for _, header := range headers {
+		t.Run(header, func(t *testing.T) {
+			c := createSubjectVersioningCluster(t, "SVABRESH", 3)
+			defer c.shutdown()
+
+			nc, _ := jsClientConnect(t, c.randomServer())
+			defer nc.Close()
+
+			cfg := testSubjectVersioningStreamConfig("SV_BATCH_RESERVED_"+header, FileStorage)
+			cfg.Replicas = 3
+			cfg.AllowAtomicPublish = true
+			_, err := jsStreamCreate(t, nc, &cfg)
+			require_NoError(t, err)
+
+			msg := nats.NewMsg("events.order.123.created")
+			msg.Header.Set(header, "99")
+			msg.Header.Set(JSBatchId, "uuid")
+			msg.Header.Set(JSBatchSeq, "1")
+			msg.Header.Set(JSBatchCommit, "1")
+			respMsg, err := nc.RequestMsg(msg, time.Second)
+			require_NoError(t, err)
+
+			var pubAck JSPubAckResponse
+			require_NoError(t, json.Unmarshal(respMsg.Data, &pubAck))
+			require_NotNil(t, pubAck.Error)
+			require_Error(t, pubAck.Error, NewJSStreamSubjectVersionHeaderServerManagedError(header))
+		})
+	}
 }
 
 func TestJetStreamClusterSubjectVersioningSurvivesLeaderChange(t *testing.T) {

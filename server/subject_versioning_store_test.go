@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !skip_store_tests
+//go:build !skip_store_tests && !skip_js_tests
 
 package server
 
@@ -219,6 +219,89 @@ func TestJetStreamSubjectVersioningUpdateRequiresEmptyStream(t *testing.T) {
 	require_Contains(t, err.Error(), "subject versioning can only be changed on an empty stream")
 }
 
+func TestJetStreamSubjectVersioningUpdateRejectsDisallowedCombos(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*StreamConfig)
+		want   string
+	}{
+		{
+			name: "max-age",
+			mutate: func(cfg *StreamConfig) {
+				cfg.MaxAge = time.Hour
+				cfg.Duplicates = time.Minute
+			},
+			want: "subject versioning requires max age to be disabled",
+		},
+		{
+			name: "max-msgs",
+			mutate: func(cfg *StreamConfig) {
+				cfg.MaxMsgs = 1
+			},
+			want: "subject versioning requires max messages to be disabled",
+		},
+		{
+			name: "max-bytes",
+			mutate: func(cfg *StreamConfig) {
+				cfg.MaxBytes = 1
+			},
+			want: "subject versioning requires max bytes to be disabled",
+		},
+		{
+			name: "max-msgs-per",
+			mutate: func(cfg *StreamConfig) {
+				cfg.MaxMsgsPer = 1
+			},
+			want: "subject versioning requires max messages per subject to be disabled",
+		},
+		{
+			name: "allow-msg-ttl",
+			mutate: func(cfg *StreamConfig) {
+				cfg.AllowMsgTTL = true
+			},
+			want: "subject versioning does not allow message TTLs",
+		},
+		{
+			name: "mirror",
+			mutate: func(cfg *StreamConfig) {
+				cfg.Mirror = &StreamSource{Name: "ORIGIN"}
+			},
+			want: "subject versioning does not support mirrors",
+		},
+		{
+			name: "sources",
+			mutate: func(cfg *StreamConfig) {
+				cfg.Sources = []*StreamSource{{Name: "ORIGIN"}}
+			},
+			want: "subject versioning does not support sources",
+		},
+		{
+			name: "republish",
+			mutate: func(cfg *StreamConfig) {
+				cfg.RePublish = &RePublish{Destination: "copy.>"}
+			},
+			want: "subject versioning does not support republish",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+
+			cfg := testSubjectVersioningStreamConfig("SV_UPDATE_"+tc.name, MemoryStorage)
+			mset, err := s.GlobalAccount().addStream(&cfg)
+			require_NoError(t, err)
+
+			updated := mset.cfg.clone()
+			tc.mutate(updated)
+			err = mset.update(updated)
+			require_Error(t, err)
+			require_Contains(t, err.Error(), tc.want)
+		})
+	}
+}
+
 func TestMemStoreSubjectVersionStateTracksCanonicalHeaders(t *testing.T) {
 	cfg := testSubjectVersioningStreamConfig("SV_MEM", MemoryStorage)
 	ms, err := newMemStore(&cfg)
@@ -255,6 +338,72 @@ func TestMemStoreSubjectVersionStateTracksCanonicalHeaders(t *testing.T) {
 	ms.mu.RLock()
 	require_Equal(t, ms.svs.Size(), 0)
 	ms.mu.RUnlock()
+}
+
+func TestFileStoreSubjectVersionStateRebuildsAfterCheckpointDeleted(t *testing.T) {
+	cfg := testSubjectVersioningStreamConfig("SV_FILE_REBUILD", FileStorage)
+	dir := t.TempDir()
+
+	fs, err := newFileStore(FileStoreConfig{StoreDir: dir}, cfg)
+	require_NoError(t, err)
+
+	for i := 0; i < 3; i++ {
+		hdr := genHeader(nil, JSSubjectVersion, fmt.Sprintf("%d", i))
+		hdr = genHeader(hdr, JSSubjectVersionKey, "events.order.123")
+		_, _, err = fs.StoreMsg("events.order.123.step", hdr, []byte("payload"), 0)
+		require_NoError(t, err)
+	}
+	require_NoError(t, fs.forceWriteFullState())
+	require_NoError(t, fs.Stop())
+
+	// Delete the checkpoint to force a linear rebuild from message headers.
+	require_NoError(t, os.Remove(filepath.Join(dir, msgDir, subjectVersionStateFile)))
+
+	reopened, err := newFileStore(FileStoreConfig{StoreDir: dir}, cfg)
+	require_NoError(t, err)
+	defer reopened.Stop()
+
+	reopened.mu.RLock()
+	sv, ok := reopened.svs.Find([]byte("events.order.123"))
+	require_True(t, ok)
+	require_Equal(t, sv.lastVersion, uint64(2))
+	require_Equal(t, sv.lastSeq, uint64(3))
+	reopened.mu.RUnlock()
+}
+
+func TestFileStoreSubjectVersionStateRebuildsAfterCheckpointAheadOfStream(t *testing.T) {
+	cfg := testSubjectVersioningStreamConfig("SV_FILE_AHEAD", FileStorage)
+	dir := t.TempDir()
+
+	fs, err := newFileStore(FileStoreConfig{StoreDir: dir}, cfg)
+	require_NoError(t, err)
+
+	hdr := genHeader(nil, JSSubjectVersion, "0")
+	hdr = genHeader(hdr, JSSubjectVersionKey, "events.order.123")
+	_, _, err = fs.StoreMsg("events.order.123.created", hdr, []byte("one"), 0)
+	require_NoError(t, err)
+	require_NoError(t, fs.forceWriteFullState())
+
+	// Hand-craft a checkpoint whose claimed sequence is far ahead of stream state.
+	fs.mu.Lock()
+	fs.state.LastSeq = 1
+	fs.mu.Unlock()
+	bogus := []byte{subjectVersionMagic, subjectVersionVer}
+	bogus = append(bogus, 0xff, 0xff, 0xff, 0x7f) // checkpointSeq well beyond LastSeq+1
+	bogus = append(bogus, 0)                      // numEntries = 0
+	require_NoError(t, os.WriteFile(filepath.Join(dir, msgDir, subjectVersionStateFile), bogus, 0o644))
+	require_NoError(t, fs.Stop())
+
+	reopened, err := newFileStore(FileStoreConfig{StoreDir: dir}, cfg)
+	require_NoError(t, err)
+	defer reopened.Stop()
+
+	reopened.mu.RLock()
+	sv, ok := reopened.svs.Find([]byte("events.order.123"))
+	require_True(t, ok)
+	require_Equal(t, sv.lastVersion, uint64(0))
+	require_Equal(t, sv.lastSeq, uint64(1))
+	reopened.mu.RUnlock()
 }
 
 func TestFileStoreSubjectVersionStateRecoversFromCheckpoint(t *testing.T) {

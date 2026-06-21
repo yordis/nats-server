@@ -370,16 +370,23 @@ func (err BatchFlowErr) MarshalJSON() ([]byte, error) {
 
 // StreamInfo shows config and current state for this stream.
 type StreamInfo struct {
-	Config     StreamConfig        `json:"config"`
-	Created    time.Time           `json:"created"`
-	State      StreamState         `json:"state"`
-	Domain     string              `json:"domain,omitempty"`
-	Cluster    *ClusterInfo        `json:"cluster,omitempty"`
-	Mirror     *StreamSourceInfo   `json:"mirror,omitempty"`
-	Sources    []*StreamSourceInfo `json:"sources,omitempty"`
-	Alternates []StreamAlternate   `json:"alternates,omitempty"`
+	Config            StreamConfig           `json:"config"`
+	Created           time.Time              `json:"created"`
+	State             StreamState            `json:"state"`
+	Domain            string                 `json:"domain,omitempty"`
+	Cluster           *ClusterInfo           `json:"cluster,omitempty"`
+	Mirror            *StreamSourceInfo      `json:"mirror,omitempty"`
+	Sources           []*StreamSourceInfo    `json:"sources,omitempty"`
+	Alternates        []StreamAlternate      `json:"alternates,omitempty"`
+	SubjectVersioning *SubjectVersioningInfo `json:"subject_versioning,omitempty"`
 	// TimeStamp indicates when the info was gathered
 	TimeStamp time.Time `json:"ts"`
+}
+
+// SubjectVersioningInfo surfaces operational state for a subject-versioned stream.
+type SubjectVersioningInfo struct {
+	// Namespaces is the count of distinct subject version namespaces tracked.
+	Namespaces int `json:"namespaces"`
 }
 
 // streamInfoClusterResponse is a response used in a cluster to communicate the stream info
@@ -5576,6 +5583,39 @@ func (mset *stream) subjectVersionKey(subject string) string {
 	return subject
 }
 
+// subjectVersioningInfo returns the current operational state for subject
+// versioning, or nil when the feature is not enabled on this stream.
+func (mset *stream) subjectVersioningInfo() *SubjectVersioningInfo {
+	if mset == nil {
+		return nil
+	}
+	if !mset.cfg.subjectVersioningEnabled() {
+		return nil
+	}
+	switch store := mset.store.(type) {
+	case *memStore:
+		store.mu.RLock()
+		defer store.mu.RUnlock()
+		if store.svs == nil {
+			return &SubjectVersioningInfo{}
+		}
+		return &SubjectVersioningInfo{Namespaces: store.svs.Size()}
+	case *fileStore:
+		store.mu.RLock()
+		defer store.mu.RUnlock()
+		if store.svs == nil {
+			return &SubjectVersioningInfo{}
+		}
+		return &SubjectVersioningInfo{Namespaces: store.svs.Size()}
+	default:
+		return &SubjectVersioningInfo{}
+	}
+}
+
+// subjectVersionState reads the current last assigned version for a namespace key.
+// Lock order: callers may hold mset.mu and/or mset.clMu but MUST NOT hold the
+// underlying store mutex — this method acquires store.mu.RLock internally and
+// nested acquisition would deadlock with writers in storeRawMsg.
 func (mset *stream) subjectVersionState(key string) (subjectVersionEntry, bool) {
 	if mset == nil || key == _EMPTY_ {
 		return subjectVersionEntry{}, false

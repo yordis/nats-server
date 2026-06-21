@@ -5991,6 +5991,11 @@ func (fs *fileStore) removeMsgFromBlock(mb *msgBlock, seq uint64, secure, viaLim
 		}
 	}
 	if fs.svs != nil {
+		// Subject versioning denies the config knobs that drive removal (deletes,
+		// purges, TTLs, max-age, max-msgs, max-bytes, max-msgs-per, mirrors, sources).
+		// Reaching here means an internal path bypassed that contract, so log and
+		// rebuild from message headers rather than letting svs drift.
+		fs.warn("Subject version state rebuild triggered by message removal at seq %d", seq)
 		if err = fs.recoverSubjectVersionState(); err != nil {
 			return false, err
 		}
@@ -12046,6 +12051,15 @@ func (fs *fileStore) writeSubjectVersionState() error {
 	return fs.writeFileWithOptionalSync(fn, buf, defaultFilePerms)
 }
 
+// recoverSubjectVersionState rebuilds the per-namespace subject version map
+// (fs.svs) from the on-disk checkpoint plus a linear scan of any messages
+// committed after the checkpoint.
+//
+// The stream snapshot does NOT include svs: stored Nats-Subject-Version[-Key]
+// headers are the source of truth, so a fresh follower replays messages and
+// rebuilds svs from those headers. Restart on the same node reads sver.db and
+// scans only the tail past the checkpoint sequence.
+//
 // Lock should be held.
 func (fs *fileStore) recoverSubjectVersionState() error {
 	if !fs.cfg.StreamConfig.subjectVersioningEnabled() {
@@ -12071,27 +12085,32 @@ func (fs *fileStore) recoverSubjectVersionState() error {
 	}
 
 	scanFrom := fs.state.FirstSeq
+	rebuildReason := "checkpoint missing"
 	if err == nil {
 		checkpointSeq, derr := fs.decodeSubjectVersionState(buf)
 		if derr != nil {
-			fs.warn("Error decoding subject version state: %s", derr)
+			fs.warn("Subject version state checkpoint is corrupt, rebuilding: %s", derr)
 			_ = os.Remove(fn)
 			fs.svs = fs.svs.Empty()
+			rebuildReason = "checkpoint corrupt"
 		} else {
 			switch {
 			case checkpointSeq < fs.state.FirstSeq:
 				scanFrom = fs.state.FirstSeq
+				rebuildReason = "checkpoint older than stream first sequence"
 			case checkpointSeq > fs.state.LastSeq+1:
 				fs.warn("Subject version state checkpoint is ahead of stream state; rebuilding from first sequence")
 				fs.svs = fs.svs.Empty()
+				rebuildReason = "checkpoint ahead of stream"
 			default:
 				scanFrom = checkpointSeq
+				rebuildReason = "checkpoint trails stream state"
 			}
 		}
 	}
 
 	if scanFrom <= fs.state.LastSeq {
-		fs.warn("Subject version state is outdated; attempting to recover using linear scan (seq %d to %d)", scanFrom, fs.state.LastSeq)
+		fs.warn("Subject version state rebuild via linear scan (seq %d to %d): %s", scanFrom, fs.state.LastSeq, rebuildReason)
 		var (
 			mb     *msgBlock
 			sm     StoreMsg

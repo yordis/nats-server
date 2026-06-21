@@ -2288,6 +2288,9 @@ func (ms *memStore) removeMsgNoCB(seq uint64, secure bool) (subj string, size ui
 	// Must delete message after updating per-subject info, to be consistent with file store.
 	delete(ms.msgs, seq)
 	if ms.svs != nil {
+		// Subject versioning denies the config knobs that drive removal. Reaching
+		// here means an internal path bypassed that contract; rebuild from the
+		// remaining headers rather than letting svs drift.
 		ms.recoverSubjectVersionStateLocked()
 	}
 

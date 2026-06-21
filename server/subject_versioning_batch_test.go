@@ -11,6 +11,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !skip_store_tests && !skip_js_tests
+
 package server
 
 import (
@@ -127,6 +129,42 @@ func TestJetStreamFastBatchSubjectVersioningExpectedVersionOnlyAllowedOnFirstMes
 			require_Equal(t, pubAck.Sequence, uint64(1))
 			require_Equal(t, pubAck.BatchId, "uuid")
 			require_Equal(t, pubAck.BatchSize, 1)
+		})
+	}
+}
+
+func TestJetStreamFastBatchSubjectVersioningRejectsReservedHeaders(t *testing.T) {
+	headers := []string{JSSubjectVersion, JSSubjectVersionKey}
+	for _, header := range headers {
+		t.Run(header, func(t *testing.T) {
+			s := RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+
+			nc, _ := jsClientConnect(t, s)
+			defer nc.Close()
+
+			cfg := testSubjectVersioningStreamConfig("SV_FAST_RESERVED_"+header, FileStorage)
+			cfg.AllowBatchPublish = true
+			_, err := jsStreamCreate(t, nc, &cfg)
+			require_NoError(t, err)
+
+			inbox := nats.NewInbox()
+			sub, err := nc.SubscribeSync(fmt.Sprintf("%s.>", inbox))
+			require_NoError(t, err)
+			defer sub.Drain()
+
+			msg := nats.NewMsg("events.order.123.created")
+			msg.Header.Set(header, "42")
+			msg.Reply = generateFastBatchReply(inbox, "uuid", 1, 0, FastBatchGapFail, FastBatchOpCommit)
+			require_NoError(t, nc.PublishMsg(msg))
+
+			rmsg, err := sub.NextMsg(time.Second)
+			require_NoError(t, err)
+
+			var pubAck JSPubAckResponse
+			require_NoError(t, json.Unmarshal(rmsg.Data, &pubAck))
+			require_True(t, pubAck.Error != nil)
+			require_Error(t, pubAck.Error, NewJSStreamSubjectVersionHeaderServerManagedError(header))
 		})
 	}
 }

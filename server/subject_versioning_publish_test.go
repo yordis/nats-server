@@ -11,11 +11,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !skip_store_tests && !skip_js_tests
+
 package server
 
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -126,6 +129,37 @@ func TestJetStreamSubjectVersioningGroupedNamespace(t *testing.T) {
 	}
 }
 
+func TestJetStreamSubjectVersioningExpectedLastSubjectVersionInvalidValues(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, _ := jsClientConnect(t, s)
+	defer nc.Close()
+
+	cfg := testSubjectVersioningStreamConfig("SV_INVALID_EXPECTED", MemoryStorage)
+	_, err := jsStreamCreate(t, nc, &cfg)
+	require_NoError(t, err)
+
+	cases := []string{
+		"-1",
+		"1e1",
+		"v1",
+		"NaN",
+		"0x1",
+		"abc",
+		"3.14",
+		"18446744073709551616", // overflows uint64
+	}
+	for _, value := range cases {
+		t.Run(fmt.Sprintf("value=%q", value), func(t *testing.T) {
+			msg := nats.NewMsg("events.order.123.created")
+			msg.Header.Set(JSExpectedLastSubjectVer, value)
+			_, err := requestSubjectVersioningPubAckResponse(nc, msg)
+			require_Error(t, err, NewJSStreamExpectedLastSubjectVersionInvalidError())
+		})
+	}
+}
+
 func TestJetStreamSubjectVersioningExpectedLastSubjectVersion(t *testing.T) {
 	for _, storage := range []StorageType{MemoryStorage, FileStorage} {
 		t.Run(storage.String(), func(t *testing.T) {
@@ -188,6 +222,53 @@ func TestJetStreamSubjectVersioningExpectedLastSubjectVersion(t *testing.T) {
 	}
 }
 
+func TestJetStreamSubjectVersioningSubjectTransformFallback(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, _ := jsClientConnect(t, s)
+	defer nc.Close()
+
+	cfg := StreamConfig{
+		Name:       "SV_FALLBACK",
+		Storage:    MemoryStorage,
+		Subjects:   []string{"events.>"},
+		Retention:  LimitsPolicy,
+		MaxMsgs:    -1,
+		MaxBytes:   -1,
+		MaxAge:     0,
+		MaxMsgsPer: -1,
+		DenyDelete: true,
+		DenyPurge:  true,
+		SubjectVersioning: &SubjectVersioningConfig{
+			Mode: SubjectVersioningModeGapless,
+			SubjectTransform: &SubjectTransformConfig{
+				Source:      "events.*.*.*",
+				Destination: "events.$1.$2",
+			},
+		},
+	}
+	_, err := jsStreamCreate(t, nc, &cfg)
+	require_NoError(t, err)
+
+	// Matches the transform: namespace key is grouped.
+	matched := requestSubjectVersioningPubAck(t, nc, nats.NewMsg("events.order.123.created"))
+	require_NotNil(t, matched.SubjectVersion)
+	require_Equal(t, matched.SubjectVersionKey, "events.order.123")
+	require_Equal(t, *matched.SubjectVersion, uint64(0))
+
+	// Does not match the transform: namespace key falls back to the stored subject.
+	unmatched := requestSubjectVersioningPubAck(t, nc, nats.NewMsg("events.heartbeat"))
+	require_NotNil(t, unmatched.SubjectVersion)
+	require_Equal(t, unmatched.SubjectVersionKey, "events.heartbeat")
+	require_Equal(t, *unmatched.SubjectVersion, uint64(0))
+
+	again := requestSubjectVersioningPubAck(t, nc, nats.NewMsg("events.heartbeat"))
+	require_NotNil(t, again.SubjectVersion)
+	require_Equal(t, again.SubjectVersionKey, "events.heartbeat")
+	require_Equal(t, *again.SubjectVersion, uint64(1))
+}
+
 func TestJetStreamSubjectVersioningDuplicatePubAckReturnsOriginalMetadata(t *testing.T) {
 	for _, storage := range []StorageType{MemoryStorage, FileStorage} {
 		t.Run(storage.String(), func(t *testing.T) {
@@ -218,6 +299,93 @@ func TestJetStreamSubjectVersioningDuplicatePubAckReturnsOriginalMetadata(t *tes
 			require_True(t, secondAck.Duplicate)
 		})
 	}
+}
+
+func TestJetStreamSubjectVersioningStreamInfoSurfacesNamespaceCount(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	cfg := testSubjectVersioningStreamConfig("SV_INFO", MemoryStorage)
+	_, err := jsStreamCreate(t, nc, &cfg)
+	require_NoError(t, err)
+
+	info, err := js.StreamInfo(cfg.Name)
+	require_NoError(t, err)
+	require_True(t, info != nil)
+
+	infoMset, err := s.GlobalAccount().lookupStream(cfg.Name)
+	require_NoError(t, err)
+	require_NotNil(t, infoMset.subjectVersioningInfo())
+	require_Equal(t, infoMset.subjectVersioningInfo().Namespaces, 0)
+
+	requestSubjectVersioningPubAck(t, nc, nats.NewMsg("events.order.123.created"))
+	requestSubjectVersioningPubAck(t, nc, nats.NewMsg("events.order.456.created"))
+	requestSubjectVersioningPubAck(t, nc, nats.NewMsg("events.order.123.cancelled"))
+
+	require_Equal(t, infoMset.subjectVersioningInfo().Namespaces, 2)
+
+	plainCfg := &StreamConfig{
+		Name:     "PLAIN_INFO",
+		Storage:  MemoryStorage,
+		Subjects: []string{"plain"},
+	}
+	_, err = jsStreamCreate(t, nc, plainCfg)
+	require_NoError(t, err)
+	plainMset, err := s.GlobalAccount().lookupStream(plainCfg.Name)
+	require_NoError(t, err)
+	require_True(t, plainMset.subjectVersioningInfo() == nil)
+}
+
+func TestJetStreamSubjectVersioningPubAckJSONShape(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, _ := jsClientConnect(t, s)
+	defer nc.Close()
+
+	cfg := testSubjectVersioningStreamConfig("SV_JSON_SHAPE", MemoryStorage)
+	_, err := jsStreamCreate(t, nc, &cfg)
+	require_NoError(t, err)
+
+	// First publish: SubjectVersion is the zero value (0). Verify the raw JSON
+	// contains the field as a number, not "null" and not omitted.
+	first := nats.NewMsg("events.order.123.created")
+	first.Header.Set(JSMsgId, "json-shape-dedupe")
+	respMsg, err := nc.RequestMsg(first, time.Second)
+	require_NoError(t, err)
+	raw := string(respMsg.Data)
+	require_Contains(t, raw, `"subject_version":0`)
+	require_Contains(t, raw, `"subject_version_key":"events.order.123"`)
+	require_True(t, !strings.Contains(raw, `"duplicate":true`))
+
+	// Duplicate publish: subject_version[ _key] must still be present, and
+	// duplicate:true must be set.
+	dup := nats.NewMsg("events.order.123.created")
+	dup.Header.Set(JSMsgId, "json-shape-dedupe")
+	dupResp, err := nc.RequestMsg(dup, time.Second)
+	require_NoError(t, err)
+	dupRaw := string(dupResp.Data)
+	require_Contains(t, dupRaw, `"subject_version":0`)
+	require_Contains(t, dupRaw, `"subject_version_key":"events.order.123"`)
+	require_Contains(t, dupRaw, `"duplicate":true`)
+
+	// Plain (non-versioned) stream must omit subject_version[ _key].
+	plainCfg := &StreamConfig{
+		Name:     "PLAIN_PUBACK",
+		Storage:  MemoryStorage,
+		Subjects: []string{"plain"},
+	}
+	_, err = jsStreamCreate(t, nc, plainCfg)
+	require_NoError(t, err)
+	plain := nats.NewMsg("plain")
+	plainResp, err := nc.RequestMsg(plain, time.Second)
+	require_NoError(t, err)
+	plainRaw := string(plainResp.Data)
+	require_True(t, !strings.Contains(plainRaw, `"subject_version"`))
+	require_True(t, !strings.Contains(plainRaw, `"subject_version_key"`))
 }
 
 func TestJetStreamSubjectVersioningRejectsUnsupportedHeaders(t *testing.T) {
