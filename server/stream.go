@@ -5589,7 +5589,10 @@ func (mset *stream) subjectVersioningInfo() *SubjectVersioningInfo {
 	if mset == nil {
 		return nil
 	}
-	if !mset.cfg.subjectVersioningEnabled() {
+	mset.cfgMu.RLock()
+	enabled := mset.cfg.subjectVersioningEnabled()
+	mset.cfgMu.RUnlock()
+	if !enabled {
 		return nil
 	}
 	switch store := mset.store.(type) {
