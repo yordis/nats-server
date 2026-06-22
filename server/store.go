@@ -79,6 +79,11 @@ type StoreMsg struct {
 	ts   int64
 }
 
+type subjectVersionEntry struct {
+	lastVersion uint64
+	lastSeq     uint64
+}
+
 // Used to call back into the upper layers to report on changes in storage resources.
 // For the cases where its a single message we will also supply sequence number and subject.
 type StorageUpdateHandler func(msgs, bytes int64, seq uint64, subj string)

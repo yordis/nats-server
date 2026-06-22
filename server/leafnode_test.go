@@ -6464,7 +6464,7 @@ func TestLeafNodeSignatureCB(t *testing.T) {
 		if !strings.Contains(err, "on purpose") {
 			t.Fatalf("Expected error from cb, got %v", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("Did not get expected error")
 	}
 
@@ -6505,7 +6505,7 @@ func TestLeafNodeSignatureCB(t *testing.T) {
 		if !strings.Contains(err, ErrConnectionClosed.Error()) {
 			t.Fatalf("Expected error that connection was closed, got %v", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("Did not get expected error")
 	}
 

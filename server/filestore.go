@@ -193,6 +193,7 @@ type fileStore struct {
 	blks        []*msgBlock
 	bim         map[uint32]*msgBlock
 	psim        *stree.SubjectTree[psi]
+	svs         *stree.SubjectTree[subjectVersionEntry]
 	tsl         int
 	wfsmu       sync.Mutex   // Only one writeFullState at a time to protect from overwrites.
 	wfsrun      atomic.Int64 // Is writeFullState already running? For timer check only
@@ -347,6 +348,9 @@ const (
 	// This is the encoded message scheduling file.
 	msgSchedulingStreamStateFile = "sched.db"
 
+	// This is the encoded subject-version namespace state file.
+	subjectVersionStateFile = "sver.db"
+
 	// AEK key sizes
 	minMetaKeySize = 64
 	minBlkKeySize  = 64
@@ -439,6 +443,9 @@ func newFileStoreWithCreated(fcfg FileStoreConfig, cfg StreamConfig, created tim
 		qch:    make(chan struct{}),
 		fsld:   make(chan struct{}),
 		srv:    fcfg.srv,
+	}
+	if cfg.subjectVersioningEnabled() {
+		fs.svs = stree.NewSubjectTree[subjectVersionEntry]()
 	}
 
 	// Register with access time service.
@@ -560,6 +567,11 @@ func newFileStoreWithCreated(fcfg FileStoreConfig, cfg StreamConfig, created tim
 	if cfg.AllowMsgSchedules {
 		if err = fs.recoverMsgSchedulingState(); err != nil && !os.IsNotExist(err) {
 			fs.warn("Recovering message scheduling state from index errored: %v", err)
+		}
+	}
+	if cfg.subjectVersioningEnabled() {
+		if err = fs.recoverSubjectVersionState(); err != nil && !os.IsNotExist(err) {
+			fs.warn("Recovering subject version state from index errored: %v", err)
 		}
 	}
 
@@ -721,6 +733,14 @@ func (fs *fileStore) UpdateConfig(cfg *StreamConfig) error {
 		}
 	} else if !cfg.AllowMsgSchedules && fs.scheduling != nil {
 		fs.scheduling = nil
+	}
+	if cfg.subjectVersioningEnabled() {
+		if err := fs.recoverSubjectVersionState(); err != nil {
+			fs.mu.Unlock()
+			return err
+		}
+	} else {
+		fs.svs = nil
 	}
 
 	// Limits checks and enforcement.
@@ -4961,6 +4981,7 @@ func (fs *fileStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts, t
 	fs.state.Bytes += n
 	fs.state.LastSeq = seq
 	fs.state.LastTime = now
+	fs.updateSubjectVersionStateLocked(hdr, seq)
 
 	// Enforce per message limits.
 	// We snapshotted psmc before our actual write, so >= comparison needed.
@@ -5966,6 +5987,16 @@ func (fs *fileStore) removeMsgFromBlock(mb *msgBlock, seq uint64, secure, viaLim
 	// we don't lose track of the first sequence.
 	if firstSeqNeedsUpdate {
 		if err = fs.selectNextFirst(); err != nil {
+			return false, err
+		}
+	}
+	if fs.svs != nil {
+		// Subject versioning denies the config knobs that drive removal (deletes,
+		// purges, TTLs, max-age, max-msgs, max-bytes, max-msgs-per, mirrors, sources).
+		// Reaching here means an internal path bypassed that contract, so log and
+		// rebuild from message headers rather than letting svs drift.
+		fs.warn("Subject version state rebuild triggered by message removal at seq %d", seq)
+		if err = fs.recoverSubjectVersionState(); err != nil {
 			return false, err
 		}
 	}
@@ -10163,6 +10194,9 @@ func (fs *fileStore) purge(fseq uint64) (purged uint64, rerr error) {
 	fs.bim = make(map[uint32]*msgBlock)
 	// Clear any per subject tracking.
 	fs.psim, fs.tsl = fs.psim.Empty(), 0
+	if fs.svs != nil {
+		fs.svs = fs.svs.Empty()
+	}
 	fs.sdm.empty()
 	// Mark dirty.
 	fs.dirty++
@@ -10656,6 +10690,9 @@ func (fs *fileStore) reset() error {
 
 	// Reset subject mappings.
 	fs.psim, fs.tsl = fs.psim.Empty(), 0
+	if fs.svs != nil {
+		fs.svs = fs.svs.Empty()
+	}
 	fs.sdm.empty()
 	fs.bim = make(map[uint32]*msgBlock)
 
@@ -10987,6 +11024,12 @@ SKIP:
 	if err = fs.resetGlobalPerSubjectInfo(); err != nil {
 		fs.mu.Unlock()
 		return err
+	}
+	if fs.svs != nil {
+		if err = fs.recoverSubjectVersionState(); err != nil {
+			fs.mu.Unlock()
+			return err
+		}
 	}
 
 	fs.dirty++
@@ -11665,6 +11708,8 @@ const (
 	fullStateMagic      = uint8(11)
 	fullStateMinVersion = uint8(1) // What is the minimum version we know how to parse?
 	fullStateVersion    = uint8(4) // What is the current version written out to index.db?
+	subjectVersionMagic = uint8(12)
+	subjectVersionVer   = uint8(1)
 )
 
 // This go routine periodically writes out our full stream state index.
@@ -11944,10 +11989,13 @@ func (fs *fileStore) _writeFullState(force bool) error {
 	// Attempt to write both files, an error in one should not prevent the other from being written.
 	ttlErr := fs.writeTTLState()
 	schedErr := fs.writeMsgSchedulingState()
+	sverErr := fs.writeSubjectVersionState()
 	if ttlErr != nil {
 		return ttlErr
 	} else if schedErr != nil {
 		return schedErr
+	} else if sverErr != nil {
+		return sverErr
 	}
 	return nil
 }
@@ -11978,6 +12026,192 @@ func (fs *fileStore) writeMsgSchedulingState() error {
 	fs.mu.RUnlock()
 
 	return fs.writeFileWithOptionalSync(fn, buf, defaultFilePerms)
+}
+
+func (fs *fileStore) writeSubjectVersionState() error {
+	fs.mu.RLock()
+	if fs.svs == nil {
+		fs.mu.RUnlock()
+		return nil
+	}
+	fn := filepath.Join(fs.fcfg.StoreDir, msgDir, subjectVersionStateFile)
+	buf := make([]byte, 0, hdrLen+(binary.MaxVarintLen64*4))
+	buf = append(buf, subjectVersionMagic, subjectVersionVer)
+	buf = binary.AppendUvarint(buf, fs.state.LastSeq+1)
+	buf = binary.AppendUvarint(buf, uint64(fs.svs.Size()))
+	fs.svs.IterFast(func(key []byte, sv *subjectVersionEntry) bool {
+		buf = binary.AppendUvarint(buf, uint64(len(key)))
+		buf = append(buf, key...)
+		buf = binary.AppendUvarint(buf, sv.lastVersion)
+		buf = binary.AppendUvarint(buf, sv.lastSeq)
+		return true
+	})
+	fs.mu.RUnlock()
+
+	return fs.writeFileWithOptionalSync(fn, buf, defaultFilePerms)
+}
+
+// recoverSubjectVersionState rebuilds the per-namespace subject version map
+// (fs.svs) from the on-disk checkpoint plus a linear scan of any messages
+// committed after the checkpoint.
+//
+// The stream snapshot does NOT include svs: stored Nats-Subject-Version[-Key]
+// headers are the source of truth, so a fresh follower replays messages and
+// rebuilds svs from those headers. Restart on the same node reads sver.db and
+// scans only the tail past the checkpoint sequence.
+//
+// Lock should be held.
+func (fs *fileStore) recoverSubjectVersionState() error {
+	if !fs.cfg.StreamConfig.subjectVersioningEnabled() {
+		fs.svs = nil
+		return nil
+	}
+	if fs.svs == nil {
+		fs.svs = stree.NewSubjectTree[subjectVersionEntry]()
+	} else {
+		fs.svs = fs.svs.Empty()
+	}
+	if fs.state.Msgs == 0 {
+		return nil
+	}
+
+	<-dios
+	fn := filepath.Join(fs.fcfg.StoreDir, msgDir, subjectVersionStateFile)
+	buf, err := os.ReadFile(fn)
+	dios <- struct{}{}
+
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	scanFrom := fs.state.FirstSeq
+	rebuildReason := "checkpoint missing"
+	if err == nil {
+		checkpointSeq, derr := fs.decodeSubjectVersionState(buf)
+		if derr != nil {
+			fs.warn("Subject version state checkpoint is corrupt, rebuilding: %s", derr)
+			_ = os.Remove(fn)
+			fs.svs = fs.svs.Empty()
+			rebuildReason = "checkpoint corrupt"
+		} else {
+			switch {
+			case checkpointSeq < fs.state.FirstSeq:
+				scanFrom = fs.state.FirstSeq
+				rebuildReason = "checkpoint older than stream first sequence"
+			case checkpointSeq > fs.state.LastSeq+1:
+				fs.warn("Subject version state checkpoint is ahead of stream state; rebuilding from first sequence")
+				fs.svs = fs.svs.Empty()
+				rebuildReason = "checkpoint ahead of stream"
+			default:
+				scanFrom = checkpointSeq
+				rebuildReason = "checkpoint trails stream state"
+			}
+		}
+	}
+
+	if scanFrom <= fs.state.LastSeq {
+		fs.warn("Subject version state rebuild via linear scan (seq %d to %d): %s", scanFrom, fs.state.LastSeq, rebuildReason)
+		var (
+			mb     *msgBlock
+			sm     StoreMsg
+			mblseq uint64
+		)
+		for seq := scanFrom; seq <= fs.state.LastSeq; seq++ {
+		retry:
+			if mb == nil {
+				if mb = fs.selectMsgBlock(seq); mb == nil {
+					fs.warn("Error loading msg block with seq %d for recovering subject versions", seq)
+					continue
+				}
+				seq = atomic.LoadUint64(&mb.first.seq)
+				mblseq = atomic.LoadUint64(&mb.last.seq)
+			}
+			if seq > mblseq {
+				mb.tryForceExpireCache()
+				mb = nil
+				if seq <= fs.state.LastSeq {
+					goto retry
+				}
+				break
+			}
+			msg, _, err := mb.fetchMsg(seq, &sm)
+			if err != nil {
+				fs.warn("Error loading msg seq %d for recovering subject versions: %s", seq, err)
+				continue
+			}
+			fs.updateSubjectVersionStateLocked(msg.hdr, msg.seq)
+		}
+	}
+	return nil
+}
+
+// Lock should be held.
+func (fs *fileStore) decodeSubjectVersionState(buf []byte) (uint64, error) {
+	if len(buf) < hdrLen || buf[0] != subjectVersionMagic || buf[1] != subjectVersionVer {
+		return 0, fmt.Errorf("subject version state is corrupt")
+	}
+
+	readUvarint := func(pos *int) (uint64, error) {
+		value, n := binary.Uvarint(buf[*pos:])
+		if n <= 0 {
+			return 0, fmt.Errorf("subject version state is corrupt")
+		}
+		*pos += n
+		return value, nil
+	}
+
+	pos := hdrLen
+	checkpointSeq, err := readUvarint(&pos)
+	if err != nil {
+		return 0, err
+	}
+	numEntries, err := readUvarint(&pos)
+	if err != nil {
+		return 0, err
+	}
+	for i := uint64(0); i < numEntries; i++ {
+		keyLen, err := readUvarint(&pos)
+		if err != nil {
+			return 0, err
+		}
+		if keyLen == 0 || pos+int(keyLen) > len(buf) {
+			return 0, fmt.Errorf("subject version state is corrupt")
+		}
+		key := buf[pos : pos+int(keyLen)]
+		pos += int(keyLen)
+		lastVersion, err := readUvarint(&pos)
+		if err != nil {
+			return 0, err
+		}
+		lastSeq, err := readUvarint(&pos)
+		if err != nil {
+			return 0, err
+		}
+		fs.svs.Insert(key, subjectVersionEntry{lastVersion: lastVersion, lastSeq: lastSeq})
+	}
+	if pos != len(buf) {
+		return 0, fmt.Errorf("subject version state is corrupt")
+	}
+	return checkpointSeq, nil
+}
+
+// Lock should be held.
+func (fs *fileStore) updateSubjectVersionStateLocked(hdr []byte, seq uint64) {
+	if fs.svs == nil || len(hdr) == 0 {
+		return
+	}
+	key, version, ok := getSubjectVersionMetadata(hdr)
+	if !ok {
+		return
+	}
+	if sv, ok := fs.svs.Find(stringToBytes(key)); ok {
+		if seq >= sv.lastSeq {
+			sv.lastSeq = seq
+			sv.lastVersion = version
+		}
+	} else {
+		fs.svs.Insert(stringToBytes(key), subjectVersionEntry{lastVersion: version, lastSeq: seq})
+	}
 }
 
 // Stop the current filestore.

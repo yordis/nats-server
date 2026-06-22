@@ -1473,12 +1473,13 @@ func (s *Server) jsStreamCreateRequest(sub *subscription, c *client, _ *Account,
 	}
 	msetCfg := mset.config()
 	resp.StreamInfo = &StreamInfo{
-		Created:   mset.createdTime(),
-		State:     mset.state(),
-		Config:    *setDynamicStreamMetadata(&msetCfg),
-		TimeStamp: time.Now().UTC(),
-		Mirror:    mset.mirrorInfo(),
-		Sources:   mset.sourcesInfo(),
+		Created:           mset.createdTime(),
+		State:             mset.state(),
+		Config:            *setDynamicStreamMetadata(&msetCfg),
+		TimeStamp:         time.Now().UTC(),
+		Mirror:            mset.mirrorInfo(),
+		Sources:           mset.sourcesInfo(),
+		SubjectVersioning: mset.subjectVersioningInfo(),
 	}
 	resp.DidCreate = true
 	s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
@@ -1578,13 +1579,14 @@ func (s *Server) jsStreamUpdateRequest(sub *subscription, c *client, _ *Account,
 
 	msetCfg := mset.config()
 	resp.StreamInfo = &StreamInfo{
-		Created:   mset.createdTime(),
-		State:     mset.state(),
-		Config:    *setDynamicStreamMetadata(&msetCfg),
-		Domain:    s.getOpts().JetStreamDomain,
-		Mirror:    mset.mirrorInfo(),
-		Sources:   mset.sourcesInfo(),
-		TimeStamp: time.Now().UTC(),
+		Created:           mset.createdTime(),
+		State:             mset.state(),
+		Config:            *setDynamicStreamMetadata(&msetCfg),
+		Domain:            s.getOpts().JetStreamDomain,
+		Mirror:            mset.mirrorInfo(),
+		Sources:           mset.sourcesInfo(),
+		SubjectVersioning: mset.subjectVersioningInfo(),
+		TimeStamp:         time.Now().UTC(),
 	}
 	s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
 }
@@ -1836,13 +1838,14 @@ func (s *Server) jsStreamListRequest(sub *subscription, c *client, _ *Account, s
 
 		config := mset.config()
 		resp.Streams = append(resp.Streams, &StreamInfo{
-			Created:   mset.createdTime(),
-			State:     mset.state(),
-			Config:    config,
-			Domain:    s.getOpts().JetStreamDomain,
-			Mirror:    mset.mirrorInfo(),
-			Sources:   mset.sourcesInfo(),
-			TimeStamp: time.Now().UTC(),
+			Created:           mset.createdTime(),
+			State:             mset.state(),
+			Config:            config,
+			Domain:            s.getOpts().JetStreamDomain,
+			Mirror:            mset.mirrorInfo(),
+			Sources:           mset.sourcesInfo(),
+			SubjectVersioning: mset.subjectVersioningInfo(),
+			TimeStamp:         time.Now().UTC(),
 		})
 		if len(resp.Streams) >= JSApiListLimit {
 			break
@@ -2017,15 +2020,16 @@ func (s *Server) jsStreamInfoRequest(sub *subscription, c *client, a *Account, s
 
 	config := mset.config()
 	resp.StreamInfo = &StreamInfo{
-		Created:    mset.createdTime(),
-		State:      mset.stateWithDetail(details),
-		Config:     *setDynamicStreamMetadata(&config),
-		Domain:     s.getOpts().JetStreamDomain,
-		Cluster:    js.clusterInfo(mset.raftGroup()),
-		Mirror:     mset.mirrorInfo(),
-		Sources:    mset.sourcesInfo(),
-		Alternates: js.streamAlternates(ci, config.Name),
-		TimeStamp:  time.Now().UTC(),
+		Created:           mset.createdTime(),
+		State:             mset.stateWithDetail(details),
+		Config:            *setDynamicStreamMetadata(&config),
+		Domain:            s.getOpts().JetStreamDomain,
+		Cluster:           js.clusterInfo(mset.raftGroup()),
+		Mirror:            mset.mirrorInfo(),
+		Sources:           mset.sourcesInfo(),
+		Alternates:        js.streamAlternates(ci, config.Name),
+		SubjectVersioning: mset.subjectVersioningInfo(),
+		TimeStamp:         time.Now().UTC(),
 	}
 	if clusterWideConsCount > 0 {
 		resp.StreamInfo.State.Consumers = clusterWideConsCount
@@ -4066,10 +4070,11 @@ func (s *Server) processStreamRestore(ci *ClientInfo, acc *Account, cfg *StreamC
 			} else {
 				msetCfg := mset.config()
 				resp.StreamInfo = &StreamInfo{
-					Created:   mset.createdTime(),
-					State:     mset.state(),
-					Config:    *setDynamicStreamMetadata(&msetCfg),
-					TimeStamp: time.Now().UTC(),
+					Created:           mset.createdTime(),
+					State:             mset.state(),
+					Config:            *setDynamicStreamMetadata(&msetCfg),
+					SubjectVersioning: mset.subjectVersioningInfo(),
+					TimeStamp:         time.Now().UTC(),
 				}
 				s.Noticef("Completed restore of %s for stream '%s > %s' in %v",
 					friendlyBytes(int64(total)), acc.Name, streamName, end.Sub(start).Round(time.Millisecond))

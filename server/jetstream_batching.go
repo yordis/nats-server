@@ -48,17 +48,18 @@ type atomicBatch struct {
 }
 
 type fastBatch struct {
-	timer          *time.Timer // Inactivity timer for the batch.
-	lseq           uint64      // The highest sequence for this batch.
-	sseq           uint64      // Last persisted stream sequence.
-	pseq           uint64      // Last persisted batch sequence (is always lower or equal to lseq).
-	fseq           uint64      // Sequence of when we last sent a flow message (is always lower or equal to pseq).
-	pending        uint32      // Number of pending messages in the batch waiting to be persisted.
-	ackMessages    uint16      // Ack will be sent every N messages.
-	maxAckMessages uint16      // Maximum ackMessages value the client allows.
-	reply          string      // The last reply subject seen when persisting a message.
-	gapOk          bool        // Whether a gap is okay, if not, the batch would be rejected.
-	commit         bool        // If the batch is committed.
+	timer           *time.Timer // Inactivity timer for the batch.
+	lseq            uint64      // The highest sequence for this batch.
+	sseq            uint64      // Last persisted stream sequence.
+	pseq            uint64      // Last persisted batch sequence (is always lower or equal to lseq).
+	fseq            uint64      // Sequence of when we last sent a flow message (is always lower or equal to pseq).
+	pending         uint32      // Number of pending messages in the batch waiting to be persisted.
+	ackMessages     uint16      // Ack will be sent every N messages.
+	maxAckMessages  uint16      // Maximum ackMessages value the client allows.
+	reply           string      // The last reply subject seen when persisting a message.
+	gapOk           bool        // Whether a gap is okay, if not, the batch would be rejected.
+	commit          bool        // If the batch is committed.
+	subjectVersions map[string]struct{}
 }
 
 // newAtomicBatch creates an atomic batch publish object.
@@ -199,6 +200,7 @@ func (batches *batching) fastBatchReset(mset *stream, batchId string, b *fastBat
 	b.commit = false
 	b.pending = 0
 	b.fseq, b.lseq = b.pseq, b.pseq
+	b.subjectVersions = nil
 	b.sendFlowControl(b.fseq, mset, b.reply)
 }
 
@@ -410,11 +412,12 @@ func getCleanupTimeout(mset *stream) time.Duration {
 
 // batchStagedDiff stages all changes for consistency checks until commit.
 type batchStagedDiff struct {
-	msgIds             map[string]struct{}
-	counter            map[string]*msgCounterRunningTotal
-	inflight           map[string]*inflightSubjectRunningTotal
-	inflightTransform  map[uint64]string
-	expectedPerSubject map[string]*batchExpectedPerSubject
+	msgIds                  map[string]struct{}
+	counter                 map[string]*msgCounterRunningTotal
+	inflight                map[string]*inflightSubjectRunningTotal
+	inflightTransform       map[uint64]string
+	inflightSubjectVersions map[string]uint64
+	expectedPerSubject      map[string]*batchExpectedPerSubject
 }
 
 type batchExpectedPerSubject struct {
@@ -468,6 +471,15 @@ func (diff *batchStagedDiff) commit(mset *stream) {
 			} else {
 				mset.inflight[subj] = i
 			}
+		}
+	}
+
+	if len(diff.inflightSubjectVersions) > 0 {
+		if mset.inflightSubjectVersions == nil {
+			mset.inflightSubjectVersions = make(map[string]uint64, len(diff.inflightSubjectVersions))
+		}
+		for key, ops := range diff.inflightSubjectVersions {
+			mset.inflightSubjectVersions[key] += ops
 		}
 	}
 
@@ -539,12 +551,13 @@ func (batch *batchApply) rejectBatchState(mset *stream) {
 // mset.mu lock must NOT be held or used.
 // mset.clMu lock must be held.
 func checkMsgHeadersPreClusteredProposal(
-	diff *batchStagedDiff, mset *stream, subject, rsubject string, hdr []byte, msg []byte, sourced bool, name string,
+	diff *batchStagedDiff, mset *stream, subject, rsubject, subjectVersionKey string, subjectVersionSeen bool, hdr []byte, msg []byte, sourced bool, name string,
 	jsa *jsAccount, allowRollup, denyPurge, allowTTL, allowMsgCounter, allowMsgSchedules bool,
 	discard DiscardPolicy, discardNewPer bool, maxMsgSize int, maxMsgs int64, maxMsgsPer int64, maxBytes int64,
 ) ([]byte, []byte, uint64, *ApiError, error) {
 	var incr *big.Int
 	var hasSchedule bool
+	subjectVersioning := subjectVersionKey != _EMPTY_
 
 	// Some header checks must be checked pre proposal.
 	if len(hdr) > 0 {
@@ -591,6 +604,48 @@ func checkMsgHeadersPreClusteredProposal(
 		// Expected stream name can also be pre-checked.
 		if sname := getExpectedStream(hdr); sname != _EMPTY_ && sname != name {
 			return hdr, msg, 0, NewJSStreamNotMatchError(), errStreamMismatch
+		}
+		if subjectVersioning {
+			if _, ok := getSubjectVersion(hdr); ok {
+				apiErr := newJSSubjectVersionReservedHeaderError(JSSubjectVersion)
+				return hdr, msg, 0, apiErr, apiErr
+			}
+			if key := getSubjectVersionKey(hdr); key != _EMPTY_ {
+				apiErr := newJSSubjectVersionReservedHeaderError(JSSubjectVersionKey)
+				return hdr, msg, 0, apiErr, apiErr
+			}
+		}
+		if expected, err := getExpectedLastSubjectVersion(hdr); err != nil {
+			apiErr := NewJSStreamExpectedLastSubjectVersionInvalidError()
+			return hdr, msg, 0, apiErr, apiErr
+		} else if expected.set {
+			if !subjectVersioning {
+				apiErr := newJSSubjectVersioningRequiredError()
+				return hdr, msg, 0, apiErr, apiErr
+			}
+			if subjectVersionSeen {
+				err := errors.New("last subject version mismatch")
+				return hdr, msg, 0, NewJSStreamWrongLastSubjectVersionConstantError(), err
+			}
+			if _, ok := diff.inflightSubjectVersions[subjectVersionKey]; ok {
+				err := errors.New("last subject version mismatch")
+				return hdr, msg, 0, NewJSStreamWrongLastSubjectVersionConstantError(), err
+			}
+			if _, found := mset.inflightSubjectVersions[subjectVersionKey]; found {
+				err := errors.New("last subject version mismatch")
+				return hdr, msg, 0, NewJSStreamWrongLastSubjectVersionConstantError(), err
+			}
+			current, found := mset.subjectVersionState(subjectVersionKey)
+			if expected.noStream {
+				if found {
+					err := fmt.Errorf("last subject version mismatch: %s vs %s", jsExpectedLastSubjectVersionNoStream, subjectVersionLabel(found, current.lastVersion))
+					return hdr, msg, 0, NewJSStreamWrongLastSubjectVersionError(subjectVersionLabel(found, current.lastVersion)), err
+				}
+			} else if !found || current.lastVersion != expected.version {
+				err := fmt.Errorf("last subject version mismatch: %d vs %s", expected.version, subjectVersionLabel(found, current.lastVersion))
+				return hdr, msg, 0, NewJSStreamWrongLastSubjectVersionError(subjectVersionLabel(found, current.lastVersion)), err
+			}
+			hdr = removeHeaderIfPresent(hdr, JSExpectedLastSubjectVer)
 		}
 		// TTL'd messages are rejected entirely if TTLs are not enabled on the stream, or if the TTL is invalid.
 		if ttl, err := getMessageTTL(hdr); !sourced && (ttl != 0 || err != nil) {
@@ -970,6 +1025,12 @@ func checkMsgHeadersPreClusteredProposal(
 	} else {
 		i = &inflightSubjectRunningTotal{bytes: sz, ops: 1, schedule: hasSchedule}
 		diff.inflight[subject] = i
+	}
+	if subjectVersioning {
+		if diff.inflightSubjectVersions == nil {
+			diff.inflightSubjectVersions = make(map[string]uint64, 1)
+		}
+		diff.inflightSubjectVersions[subjectVersionKey]++
 	}
 
 	// Subject transform.

@@ -28,7 +28,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -4612,6 +4611,20 @@ func (js *jetStream) applyStreamMsgOp(mset *stream, op entryOp, mbuf []byte, isR
 		mset.clMu.Unlock()
 	}
 
+	if mset.inflightSubjectVersions != nil {
+		mset.clMu.Lock()
+		if key := mset.subjectVersionKey(csubject); key != _EMPTY_ {
+			if ops, found := mset.inflightSubjectVersions[key]; found {
+				if ops <= 1 {
+					delete(mset.inflightSubjectVersions, key)
+				} else {
+					mset.inflightSubjectVersions[key] = ops - 1
+				}
+			}
+		}
+		mset.clMu.Unlock()
+	}
+
 	// Update running total for counter.
 	if mset.clusteredCounterTotal != nil {
 		mset.clMu.Lock()
@@ -4728,6 +4741,7 @@ func (js *jetStream) processStreamLeaderChange(mset *stream, isLeader bool) {
 	// Clear inflight if we have it.
 	mset.inflight = nil
 	mset.inflightTransform = nil
+	mset.inflightSubjectVersions = nil
 	// Clear running counter totals.
 	mset.clusteredCounterTotal = nil
 	// Clear expected per subject state.
@@ -10230,6 +10244,7 @@ func (mset *stream) processClusteredInboundMsg(subject, reply string, hdr, msg [
 	s, js, jsa, st, r, tierName, outq, node := mset.srv, mset.js, mset.jsa, mset.cfg.Storage, mset.cfg.Replicas, mset.tier, mset.outq, mset.node
 	maxMsgSize, lseq := int(mset.cfg.MaxMsgSize), mset.lseq
 	isLeader, isSealed, allowRollup, denyPurge, allowTTL, allowMsgCounter, allowMsgSchedules := mset.isLeader(), mset.cfg.Sealed, mset.cfg.AllowRollup, mset.cfg.DenyPurge, mset.cfg.AllowMsgTTL, mset.cfg.AllowMsgCounter, mset.cfg.AllowMsgSchedules
+	subjectVersioning := mset.cfg.subjectVersioningEnabled()
 
 	// Apply the input subject transform if any
 	csubject := subject
@@ -10239,6 +10254,10 @@ func (mset *stream) processClusteredInboundMsg(subject, reply string, hdr, msg [
 			// no filtering: if the subject doesn't map the source of the transform, don't change it
 			csubject = ts
 		}
+	}
+	subjectVersionKey := _EMPTY_
+	if subjectVersioning {
+		subjectVersionKey = mset.subjectVersionKey(csubject)
 	}
 	mset.mu.RUnlock()
 
@@ -10333,13 +10352,10 @@ func (mset *stream) processClusteredInboundMsg(subject, reply string, hdr, msg [
 		err    error
 	)
 	diff := &batchStagedDiff{}
-	if hdr, msg, dseq, apiErr, err = checkMsgHeadersPreClusteredProposal(diff, mset, csubject, subject, hdr, msg, sourced, name, jsa, allowRollup, denyPurge, allowTTL, allowMsgCounter, allowMsgSchedules, discard, discardNewPer, maxMsgSize, maxMsgs, maxMsgsPer, maxBytes); err != nil {
+	if hdr, msg, dseq, apiErr, err = checkMsgHeadersPreClusteredProposal(diff, mset, csubject, subject, subjectVersionKey, false, hdr, msg, sourced, name, jsa, allowRollup, denyPurge, allowTTL, allowMsgCounter, allowMsgSchedules, discard, discardNewPer, maxMsgSize, maxMsgs, maxMsgsPer, maxBytes); err != nil {
 		mset.clMu.Unlock()
 		if err == errMsgIdDuplicate && dseq > 0 {
-			var buf [256]byte
-			pubAck := append(buf[:0], mset.pubAck...)
-			response = append(pubAck, strconv.FormatUint(dseq, 10)...)
-			response = append(response, ",\"duplicate\": true}"...)
+			response = mset.duplicatePubAckResponse(dseq, _EMPTY_, 0)
 			outq.sendMsg(reply, response)
 			return err
 		}

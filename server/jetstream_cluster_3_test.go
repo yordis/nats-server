@@ -8888,15 +8888,25 @@ func TestJetStreamClusteredStreamCreateIdempotentWithSources(t *testing.T) {
 	// via the shared StreamSource pointer.
 	ml := c.leader()
 	require_NotNil(t, ml)
-	sl := c.streamLeader(globalAccountName, "SOURCED")
-	require_NotNil(t, sl)
-	if sl != ml {
-		mset, err := sl.globalAccount().lookupStream("SOURCED")
-		require_NoError(t, err)
-		require_NoError(t, mset.raftNode().StepDown(ml.Node()))
-		c.waitOnStreamLeader(globalAccountName, "SOURCED")
+	var sl *Server
+	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
 		sl = c.streamLeader(globalAccountName, "SOURCED")
-	}
+		if sl == nil {
+			return errors.New("no stream leader")
+		}
+		if sl == ml {
+			return nil
+		}
+		mset, err := sl.globalAccount().lookupStream("SOURCED")
+		if err != nil {
+			return err
+		}
+		if err := mset.raftNode().StepDown(ml.Node()); err != nil {
+			return err
+		}
+		c.waitOnStreamLeader(globalAccountName, "SOURCED")
+		return fmt.Errorf("stream leader still %s", sl)
+	})
 	require_Equal(t, ml, sl)
 
 	// The second create should be idempotent, and succeed even though iname was set.

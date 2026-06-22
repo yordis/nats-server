@@ -74,6 +74,9 @@ type StreamConfig struct {
 	// Allow applying a subject transform to incoming messages before doing anything else
 	SubjectTransform *SubjectTransformConfig `json:"subject_transform,omitempty"`
 
+	// Allow the stream to assign canonical gapless subject versions per derived namespace.
+	SubjectVersioning *SubjectVersioningConfig `json:"subject_versioning,omitempty"`
+
 	// Allow republish of the message after being sequenced and stored.
 	RePublish *RePublish `json:"republish,omitempty"`
 
@@ -152,6 +155,14 @@ func (cfg *StreamConfig) clone() *StreamConfig {
 		transform := *cfg.SubjectTransform
 		clone.SubjectTransform = &transform
 	}
+	if cfg.SubjectVersioning != nil {
+		subjectVersioning := *cfg.SubjectVersioning
+		if cfg.SubjectVersioning.SubjectTransform != nil {
+			transform := *cfg.SubjectVersioning.SubjectTransform
+			subjectVersioning.SubjectTransform = &transform
+		}
+		clone.SubjectVersioning = &subjectVersioning
+	}
 	if cfg.RePublish != nil {
 		rePublish := *cfg.RePublish
 		clone.RePublish = &rePublish
@@ -165,9 +176,25 @@ func (cfg *StreamConfig) clone() *StreamConfig {
 	return &clone
 }
 
+func (cfg *StreamConfig) subjectVersioningEnabled() bool {
+	return cfg != nil && cfg.SubjectVersioning != nil && cfg.SubjectVersioning.Mode == SubjectVersioningModeGapless
+}
+
 type StreamConsumerLimits struct {
 	InactiveThreshold time.Duration `json:"inactive_threshold,omitempty"`
 	MaxAckPending     int           `json:"max_ack_pending,omitempty"`
+}
+
+type SubjectVersioningMode string
+
+const (
+	SubjectVersioningModeGapless SubjectVersioningMode = "gapless"
+)
+
+type SubjectVersioningConfig struct {
+	Mode SubjectVersioningMode `json:"mode,omitempty"`
+	// Allow deriving a version namespace key from the final stored subject.
+	SubjectTransform *SubjectTransformConfig `json:"subject_transform,omitempty"`
 }
 
 // SubjectTransformConfig is for applying a subject transform (to matching messages) before doing anything else when a new message is received
@@ -258,13 +285,15 @@ func (r *JSPubAckResponse) ToError() error {
 // PubAck is the detail you get back from a publish to a stream that was successful.
 // e.g. +OK {"stream": "Orders", "seq": 22}
 type PubAck struct {
-	Stream    string `json:"stream"`
-	Sequence  uint64 `json:"seq"`
-	Domain    string `json:"domain,omitempty"`
-	Duplicate bool   `json:"duplicate,omitempty"`
-	Value     string `json:"val,omitempty"`
-	BatchId   string `json:"batch,omitempty"`
-	BatchSize uint64 `json:"count,omitempty"`
+	Stream            string  `json:"stream"`
+	Sequence          uint64  `json:"seq"`
+	Domain            string  `json:"domain,omitempty"`
+	SubjectVersion    *uint64 `json:"subject_version,omitempty"`
+	SubjectVersionKey string  `json:"subject_version_key,omitempty"`
+	Duplicate         bool    `json:"duplicate,omitempty"`
+	Value             string  `json:"val,omitempty"`
+	BatchId           string  `json:"batch,omitempty"`
+	BatchSize         uint64  `json:"count,omitempty"`
 }
 
 // CounterValue is the body of a message when used as a counter.
@@ -341,16 +370,23 @@ func (err BatchFlowErr) MarshalJSON() ([]byte, error) {
 
 // StreamInfo shows config and current state for this stream.
 type StreamInfo struct {
-	Config     StreamConfig        `json:"config"`
-	Created    time.Time           `json:"created"`
-	State      StreamState         `json:"state"`
-	Domain     string              `json:"domain,omitempty"`
-	Cluster    *ClusterInfo        `json:"cluster,omitempty"`
-	Mirror     *StreamSourceInfo   `json:"mirror,omitempty"`
-	Sources    []*StreamSourceInfo `json:"sources,omitempty"`
-	Alternates []StreamAlternate   `json:"alternates,omitempty"`
+	Config            StreamConfig           `json:"config"`
+	Created           time.Time              `json:"created"`
+	State             StreamState            `json:"state"`
+	Domain            string                 `json:"domain,omitempty"`
+	Cluster           *ClusterInfo           `json:"cluster,omitempty"`
+	Mirror            *StreamSourceInfo      `json:"mirror,omitempty"`
+	Sources           []*StreamSourceInfo    `json:"sources,omitempty"`
+	Alternates        []StreamAlternate      `json:"alternates,omitempty"`
+	SubjectVersioning *SubjectVersioningInfo `json:"subject_versioning,omitempty"`
 	// TimeStamp indicates when the info was gathered
 	TimeStamp time.Time `json:"ts"`
+}
+
+// SubjectVersioningInfo surfaces operational state for a subject-versioned stream.
+type SubjectVersioningInfo struct {
+	// Namespaces is the count of distinct subject version namespaces tracked.
+	Namespaces int `json:"namespaces"`
 }
 
 // streamInfoClusterResponse is a response used in a cluster to communicate the stream info
@@ -523,6 +559,9 @@ type stream struct {
 	// For input subject transform.
 	itr *subjectTransform
 
+	// For deriving subject version namespace keys.
+	svtr *subjectTransform
+
 	// For republishing.
 	tr *subjectTransform
 
@@ -559,6 +598,7 @@ type stream struct {
 
 	inflight                    map[string]*inflightSubjectRunningTotal // Inflight message sizes per subject.
 	inflightTransform           map[uint64]string                       // Inflight message's optional transformed subject.
+	inflightSubjectVersions     map[string]uint64                       // Inflight operations per subject-version namespace.
 	clusteredCounterTotal       map[string]*msgCounterRunningTotal      // Inflight counter totals.
 	expectedPerSubjectSequence  map[uint64]string                       // Inflight 'expected per subject' subjects per clseq.
 	expectedPerSubjectInProcess map[string]struct{}                     // Current 'expected per subject' subjects in process.
@@ -631,7 +671,10 @@ const (
 	JSExpectedLastSeq         = "Nats-Expected-Last-Sequence"
 	JSExpectedLastSubjSeq     = "Nats-Expected-Last-Subject-Sequence"
 	JSExpectedLastSubjSeqSubj = "Nats-Expected-Last-Subject-Sequence-Subject"
+	JSExpectedLastSubjectVer  = "Nats-Expected-Last-Subject-Version"
 	JSExpectedLastMsgId       = "Nats-Expected-Last-Msg-Id"
+	JSSubjectVersion          = "Nats-Subject-Version"
+	JSSubjectVersionKey       = "Nats-Subject-Version-Key"
 	JSStreamSource            = "Nats-Stream-Source"
 	JSLastConsumerSeq         = "Nats-Last-Consumer"
 	JSLastStreamSeq           = "Nats-Last-Stream"
@@ -653,6 +696,8 @@ const (
 	JSScheduleTarget          = "Nats-Schedule-Target"
 	JSScheduleSource          = "Nats-Schedule-Source"
 )
+
+const jsExpectedLastSubjectVersionNoStream = "no_stream"
 
 // Headers for published KV messages.
 var (
@@ -947,6 +992,14 @@ func (a *Account) addStreamWithAssignment(config *StreamConfig, fsConfig *FileSt
 			return nil, fmt.Errorf("stream subject transform from '%s' to '%s': %w", cfg.SubjectTransform.Source, cfg.SubjectTransform.Destination, err)
 		}
 		mset.itr = tr
+	}
+	if cfg.SubjectVersioning != nil && cfg.SubjectVersioning.SubjectTransform != nil {
+		tr, err := NewSubjectTransform(cfg.SubjectVersioning.SubjectTransform.Source, cfg.SubjectVersioning.SubjectTransform.Destination)
+		if err != nil {
+			jsa.mu.Unlock()
+			return nil, fmt.Errorf("stream subject versioning transform from '%s' to '%s': %w", cfg.SubjectVersioning.SubjectTransform.Source, cfg.SubjectVersioning.SubjectTransform.Destination, err)
+		}
+		mset.svtr = tr
 	}
 
 	// Check for RePublish.
@@ -1814,6 +1867,52 @@ func (s *Server) checkStreamCfg(config *StreamConfig, acc *Account, pedantic boo
 		}
 	}
 
+	if cfg.SubjectVersioning != nil {
+		if cfg.SubjectVersioning.Mode != SubjectVersioningModeGapless {
+			return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject versioning mode must be %q", SubjectVersioningModeGapless))
+		}
+		if tr := cfg.SubjectVersioning.SubjectTransform; tr != nil {
+			if tr.Source != _EMPTY_ && !IsValidSubject(tr.Source) {
+				return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject versioning transform source is invalid: %w %s", ErrBadSubject, tr.Source))
+			}
+			if err := ValidateMapping(tr.Source, tr.Destination); err != nil {
+				return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject versioning transform destination is invalid: %w", err))
+			}
+		}
+		switch {
+		case cfg.Retention != LimitsPolicy:
+			return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject versioning requires limits retention"))
+		case cfg.MaxAge != 0:
+			return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject versioning requires max age to be disabled"))
+		case cfg.MaxMsgs != -1:
+			return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject versioning requires max messages to be disabled"))
+		case cfg.MaxBytes != -1:
+			return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject versioning requires max bytes to be disabled"))
+		case cfg.MaxMsgsPer != -1:
+			return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject versioning requires max messages per subject to be disabled"))
+		case !cfg.DenyDelete:
+			return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject versioning requires deny delete"))
+		case !cfg.DenyPurge:
+			return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject versioning requires deny purge"))
+		case cfg.AllowRollup:
+			return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject versioning does not allow rollups"))
+		case cfg.AllowMsgTTL:
+			return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject versioning does not allow message TTLs"))
+		case cfg.SubjectDeleteMarkerTTL != 0:
+			return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject versioning does not allow subject delete markers"))
+		case cfg.AllowMsgCounter:
+			return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject versioning does not allow counter mode"))
+		case cfg.AllowMsgSchedules:
+			return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject versioning does not allow message scheduling"))
+		case cfg.Mirror != nil:
+			return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject versioning does not support mirrors"))
+		case len(cfg.Sources) > 0:
+			return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject versioning does not support sources"))
+		case cfg.RePublish != nil:
+			return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject versioning does not support republish"))
+		}
+	}
+
 	getStream := func(streamName string) (bool, StreamConfig) {
 		var exists bool
 		var cfg StreamConfig
@@ -2417,6 +2516,13 @@ func (mset *stream) updateWithAdvisory(config *StreamConfig, sendAdvisory bool, 
 	if err != nil {
 		return NewJSStreamInvalidConfigError(err, Unless(err))
 	}
+	if !reflect.DeepEqual(ocfg.SubjectVersioning, cfg.SubjectVersioning) {
+		var state StreamState
+		mset.store.FastState(&state)
+		if state.Msgs > 0 {
+			return NewJSStreamInvalidConfigError(fmt.Errorf("subject versioning can only be changed on an empty stream"))
+		}
+	}
 
 	// In the event that some of the stream-level limits have changed, yell appropriately
 	// if any of the consumers exceed that limit.
@@ -2640,6 +2746,16 @@ func (mset *stream) updateWithAdvisory(config *StreamConfig, sendAdvisory bool, 
 		mset.itr = tr
 	} else if ocfg.SubjectTransform != nil && cfg.SubjectTransform == nil {
 		mset.itr = nil
+	}
+	if cfg.SubjectVersioning != nil && cfg.SubjectVersioning.SubjectTransform != nil {
+		tr, err := NewSubjectTransform(cfg.SubjectVersioning.SubjectTransform.Source, cfg.SubjectVersioning.SubjectTransform.Destination)
+		if err != nil {
+			mset.mu.Unlock()
+			return fmt.Errorf("stream configuration for subject versioning transform from '%s' to '%s': %w", cfg.SubjectVersioning.SubjectTransform.Source, cfg.SubjectVersioning.SubjectTransform.Destination, err)
+		}
+		mset.svtr = tr
+	} else {
+		mset.svtr = nil
 	}
 
 	js := mset.js
@@ -5364,6 +5480,206 @@ func getExpectedLastSeqPerSubjectForSubject(hdr []byte) string {
 	return bytesToString(sliceHeader(JSExpectedLastSubjSeqSubj, hdr))
 }
 
+func getSubjectVersion(hdr []byte) (uint64, bool) {
+	bver := sliceHeader(JSSubjectVersion, hdr)
+	if len(bver) == 0 {
+		return 0, false
+	}
+	version, err := strconv.ParseUint(bytesToString(bver), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return version, true
+}
+
+func getSubjectVersionKey(hdr []byte) string {
+	return bytesToString(sliceHeader(JSSubjectVersionKey, hdr))
+}
+
+func getSubjectVersionMetadata(hdr []byte) (string, uint64, bool) {
+	key := getSubjectVersionKey(hdr)
+	if key == _EMPTY_ {
+		return _EMPTY_, 0, false
+	}
+	version, ok := getSubjectVersion(hdr)
+	if !ok {
+		return _EMPTY_, 0, false
+	}
+	return key, version, true
+}
+
+type expectedLastSubjectVersion struct {
+	set      bool
+	noStream bool
+	version  uint64
+}
+
+func getExpectedLastSubjectVersion(hdr []byte) (expectedLastSubjectVersion, error) {
+	bver := sliceHeader(JSExpectedLastSubjectVer, hdr)
+	if len(bver) == 0 {
+		return expectedLastSubjectVersion{}, nil
+	}
+	value := bytesToString(bver)
+	if value == jsExpectedLastSubjectVersionNoStream {
+		return expectedLastSubjectVersion{set: true, noStream: true}, nil
+	}
+	version, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return expectedLastSubjectVersion{}, err
+	}
+	return expectedLastSubjectVersion{set: true, version: version}, nil
+}
+
+func newJSSubjectVersioningRequiredError() *ApiError {
+	return NewJSStreamExpectedLastSubjectVersionRequiresVersioningError()
+}
+
+func newJSSubjectVersionReservedHeaderError(header string) *ApiError {
+	return NewJSStreamSubjectVersionHeaderServerManagedError(header)
+}
+
+func upsertHeader(hdr []byte, key, value string) []byte {
+	if len(hdr) == 0 {
+		return genHeader(nil, key, value)
+	}
+	return setHeader(key, value, hdr)
+}
+
+func appendPubAckResponse(dst []byte, seq uint64, duplicate bool, batchID string, batchSeq uint64, counterValue *string, subjectVersion *uint64, subjectVersionKey string) []byte {
+	dst = strconv.AppendUint(dst, seq, 10)
+	if subjectVersion != nil {
+		dst = append(dst, ",\"subject_version\":"...)
+		dst = strconv.AppendUint(dst, *subjectVersion, 10)
+	}
+	if subjectVersionKey != _EMPTY_ {
+		dst = append(dst, ",\"subject_version_key\":"...)
+		dst = strconv.AppendQuote(dst, subjectVersionKey)
+	}
+	if duplicate {
+		dst = append(dst, ",\"duplicate\":true"...)
+	}
+	if batchID != _EMPTY_ {
+		dst = append(dst, ",\"batch\":"...)
+		dst = strconv.AppendQuote(dst, batchID)
+		dst = append(dst, ",\"count\":"...)
+		dst = strconv.AppendUint(dst, batchSeq, 10)
+	}
+	if counterValue != nil {
+		dst = append(dst, ",\"val\":"...)
+		dst = strconv.AppendQuote(dst, *counterValue)
+	}
+	return append(dst, '}')
+}
+
+func (mset *stream) subjectVersionKey(subject string) string {
+	if mset == nil {
+		return _EMPTY_
+	}
+	if mset.svtr != nil {
+		if key, err := mset.svtr.Match(subject); err == nil && key != _EMPTY_ {
+			return key
+		}
+	}
+	return subject
+}
+
+// subjectVersioningInfo returns the current operational state for subject
+// versioning, or nil when the feature is not enabled on this stream.
+func (mset *stream) subjectVersioningInfo() *SubjectVersioningInfo {
+	if mset == nil {
+		return nil
+	}
+	mset.cfgMu.RLock()
+	enabled := mset.cfg.subjectVersioningEnabled()
+	mset.cfgMu.RUnlock()
+	if !enabled {
+		return nil
+	}
+	switch store := mset.store.(type) {
+	case *memStore:
+		store.mu.RLock()
+		defer store.mu.RUnlock()
+		if store.svs == nil {
+			return &SubjectVersioningInfo{}
+		}
+		return &SubjectVersioningInfo{Namespaces: store.svs.Size()}
+	case *fileStore:
+		store.mu.RLock()
+		defer store.mu.RUnlock()
+		if store.svs == nil {
+			return &SubjectVersioningInfo{}
+		}
+		return &SubjectVersioningInfo{Namespaces: store.svs.Size()}
+	default:
+		return &SubjectVersioningInfo{}
+	}
+}
+
+// subjectVersionState reads the current last assigned version for a namespace key.
+// Lock order: callers may hold mset.mu and/or mset.clMu but MUST NOT hold the
+// underlying store mutex — this method acquires store.mu.RLock internally and
+// nested acquisition would deadlock with writers in storeRawMsg.
+func (mset *stream) subjectVersionState(key string) (subjectVersionEntry, bool) {
+	if mset == nil || key == _EMPTY_ {
+		return subjectVersionEntry{}, false
+	}
+	switch store := mset.store.(type) {
+	case *memStore:
+		store.mu.RLock()
+		defer store.mu.RUnlock()
+		if store.svs == nil {
+			return subjectVersionEntry{}, false
+		}
+		if entry, ok := store.svs.Find(stringToBytes(key)); ok {
+			return *entry, true
+		}
+		return subjectVersionEntry{}, false
+	case *fileStore:
+		store.mu.RLock()
+		defer store.mu.RUnlock()
+		if store.svs == nil {
+			return subjectVersionEntry{}, false
+		}
+		if entry, ok := store.svs.Find(stringToBytes(key)); ok {
+			return *entry, true
+		}
+		return subjectVersionEntry{}, false
+	default:
+		return subjectVersionEntry{}, false
+	}
+}
+
+func (mset *stream) loadStoredSubjectVersionMetadata(seq uint64) (string, uint64, bool) {
+	if mset == nil || seq == 0 || mset.store == nil {
+		return _EMPTY_, 0, false
+	}
+	var smv StoreMsg
+	sm, err := mset.store.LoadMsg(seq, &smv)
+	if err != nil || sm == nil {
+		return _EMPTY_, 0, false
+	}
+	return getSubjectVersionMetadata(sm.hdr)
+}
+
+func (mset *stream) duplicatePubAckResponse(seq uint64, batchID string, batchSeq uint64) []byte {
+	var buf [256]byte
+	pubAck := append(buf[:0], mset.pubAck...)
+	var subjectVersion *uint64
+	subjectVersionKey := _EMPTY_
+	if key, version, ok := mset.loadStoredSubjectVersionMetadata(seq); ok {
+		subjectVersion = &version
+		subjectVersionKey = key
+	}
+	return appendPubAckResponse(pubAck, seq, true, batchID, batchSeq, nil, subjectVersion, subjectVersionKey)
+}
+
+func subjectVersionLabel(found bool, version uint64) string {
+	if !found {
+		return jsExpectedLastSubjectVersionNoStream
+	}
+	return strconv.FormatUint(version, 10)
+}
+
 // Fast lookup of the message TTL from headers:
 // - Positive return value: duration in seconds.
 // - Zero return value: no TTL or parse error.
@@ -6181,6 +6497,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 	interestRetention := mset.cfg.Retention == InterestPolicy
 	allowMsgCounter, allowMsgSchedules := mset.cfg.AllowMsgCounter, mset.cfg.AllowMsgSchedules
 	allowRollupPurge := mset.cfg.AllowRollup && !mset.cfg.DenyPurge
+	subjectVersioning := mset.cfg.subjectVersioningEnabled()
 	// Snapshot if we are the leader and if we can respond.
 	isLeader, isSealed := mset.isLeaderNodeState(), mset.cfg.Sealed
 	isClustered, isMirror := mset.isClustered(), mset.cfg.Mirror != nil
@@ -6278,6 +6595,9 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 	var msgId string
 	var incr *big.Int
 	var rollupSub, rollupAll bool
+	var subjectVersionKey string
+	var subjectVersion uint64
+	var hasSubjectVersion bool
 
 	if len(hdr) > 0 {
 		// Certain checks have already been performed if in clustered mode, so only check if not.
@@ -6352,6 +6672,76 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 					outq.sendMsg(reply, b)
 				}
 				return errStreamMismatch
+			}
+
+			if subjectVersioning {
+				if _, ok := getSubjectVersion(hdr); ok {
+					apiErr := newJSSubjectVersionReservedHeaderError(JSSubjectVersion)
+					if canRespond {
+						resp.PubAck = &PubAck{Stream: name}
+						resp.Error = apiErr
+						b, _ := json.Marshal(resp)
+						outq.sendMsg(reply, b)
+					}
+					return apiErr
+				}
+				if key := getSubjectVersionKey(hdr); key != _EMPTY_ {
+					apiErr := newJSSubjectVersionReservedHeaderError(JSSubjectVersionKey)
+					if canRespond {
+						resp.PubAck = &PubAck{Stream: name}
+						resp.Error = apiErr
+						b, _ := json.Marshal(resp)
+						outq.sendMsg(reply, b)
+					}
+					return apiErr
+				}
+			}
+			if expected, err := getExpectedLastSubjectVersion(hdr); err != nil {
+				apiErr := NewJSStreamExpectedLastSubjectVersionInvalidError()
+				if canRespond {
+					resp.PubAck = &PubAck{Stream: name}
+					resp.Error = apiErr
+					b, _ := json.Marshal(resp)
+					outq.sendMsg(reply, b)
+				}
+				return apiErr
+			} else if expected.set {
+				if !subjectVersioning {
+					apiErr := newJSSubjectVersioningRequiredError()
+					if canRespond {
+						resp.PubAck = &PubAck{Stream: name}
+						resp.Error = apiErr
+						b, _ := json.Marshal(resp)
+						outq.sendMsg(reply, b)
+					}
+					return apiErr
+				}
+				if subjectVersionKey == _EMPTY_ {
+					subjectVersionKey = mset.subjectVersionKey(subject)
+				}
+				current, found := mset.subjectVersionState(subjectVersionKey)
+				if expected.noStream {
+					if found {
+						apiErr := NewJSStreamWrongLastSubjectVersionError(subjectVersionLabel(found, current.lastVersion))
+						if canRespond {
+							resp.PubAck = &PubAck{Stream: name}
+							resp.Error = apiErr
+							b, _ := json.Marshal(resp)
+							outq.sendMsg(reply, b)
+						}
+						return apiErr
+					}
+				} else if !found || current.lastVersion != expected.version {
+					apiErr := NewJSStreamWrongLastSubjectVersionError(subjectVersionLabel(found, current.lastVersion))
+					if canRespond {
+						resp.PubAck = &PubAck{Stream: name}
+						resp.Error = apiErr
+						b, _ := json.Marshal(resp)
+						outq.sendMsg(reply, b)
+					}
+					return apiErr
+				}
+				hdr = removeHeaderIfPresent(hdr, JSExpectedLastSubjectVer)
 			}
 
 			// TTL'd messages are rejected entirely if TTLs are not enabled on the stream.
@@ -6613,9 +7003,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 				mset.ddMu.Unlock()
 				if seq > 0 {
 					if canRespond {
-						response := append(pubAck, strconv.FormatUint(seq, 10)...)
-						response = append(response, ",\"duplicate\": true}"...)
-						outq.sendMsg(reply, response)
+						outq.sendMsg(reply, mset.duplicatePubAckResponse(seq, batchId, batchSeq))
 					}
 					return errMsgIdDuplicate
 				}
@@ -6792,6 +7180,19 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			}
 			return ErrMaxPayload
 		}
+	}
+
+	if subjectVersioning {
+		if subjectVersionKey == _EMPTY_ {
+			subjectVersionKey = mset.subjectVersionKey(subject)
+		}
+		current, found := mset.subjectVersionState(subjectVersionKey)
+		if found {
+			subjectVersion = current.lastVersion + 1
+		}
+		hasSubjectVersion = true
+		hdr = upsertHeader(hdr, JSSubjectVersionKey, subjectVersionKey)
+		hdr = upsertHeader(hdr, JSSubjectVersion, strconv.FormatUint(subjectVersion, 10))
 	}
 
 	// Check to see if we are over the max msg size.
@@ -7086,16 +7487,17 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 
 	// Send response here.
 	if canRespond {
-		response = append(pubAck, strconv.FormatUint(seq, 10)...)
-		if batchId != _EMPTY_ {
-			response = append(response, fmt.Sprintf(",\"batch\":%q,\"count\":%d}", batchId, batchSeq)...)
-		} else if allowMsgCounter {
+		var subjectVersionPtr *uint64
+		if hasSubjectVersion {
+			subjectVersionPtr = &subjectVersion
+		}
+		var counterValue *string
+		if allowMsgCounter {
 			var counter CounterValue
 			json.Unmarshal(msg, &counter)
-			response = append(response, fmt.Sprintf(",\"val\":%q}", counter.Value)...)
-		} else {
-			response = append(response, '}')
+			counterValue = &counter.Value
 		}
+		response = appendPubAckResponse(pubAck, seq, false, batchId, batchSeq, counterValue, subjectVersionPtr, subjectVersionKey)
 		outq.sendMsg(reply, response)
 	}
 
@@ -7144,6 +7546,7 @@ func (mset *stream) processJetStreamAtomicBatchMsg(batchId, subject, reply strin
 	s, js, jsa, r, tierName, outq, node := mset.srv, mset.js, mset.jsa, mset.cfg.Replicas, mset.tier, mset.outq, mset.node
 	maxMsgSize, lseq := int(mset.cfg.MaxMsgSize), mset.lseq
 	isLeader, isClustered, isSealed, allowRollup, denyPurge, allowTTL, allowMsgCounter, allowMsgSchedules, allowAtomicPublish := mset.isLeader(), mset.isClustered(), mset.cfg.Sealed, mset.cfg.AllowRollup, mset.cfg.DenyPurge, mset.cfg.AllowMsgTTL, mset.cfg.AllowMsgCounter, mset.cfg.AllowMsgSchedules, mset.cfg.AllowAtomicPublish
+	subjectVersioning := mset.cfg.subjectVersioningEnabled()
 	mset.mu.RUnlock()
 
 	// If message tracing (with message delivery), we will need to send the
@@ -7473,13 +7876,17 @@ func (mset *stream) processJetStreamAtomicBatchMsg(batchId, subject, reply strin
 				csubj = ts
 			}
 		}
+		subjectVersionKey := _EMPTY_
+		if subjectVersioning {
+			subjectVersionKey = mset.subjectVersionKey(csubj)
+		}
 
 		// Reject unsupported headers.
 		if getExpectedLastMsgId(bhdr) != _EMPTY_ {
 			return errorOnUnsupported(JSExpectedLastMsgId)
 		}
 
-		if bhdr, bmsg, _, apiErr, err = checkMsgHeadersPreClusteredProposal(diff, mset, csubj, bsubj, bhdr, bmsg, false, name, jsa, allowRollup, denyPurge, allowTTL, allowMsgCounter, allowMsgSchedules, discard, discardNewPer, maxMsgSize, maxMsgs, maxMsgsPer, maxBytes); err != nil {
+		if bhdr, bmsg, _, apiErr, err = checkMsgHeadersPreClusteredProposal(diff, mset, csubj, bsubj, subjectVersionKey, false, bhdr, bmsg, false, name, jsa, allowRollup, denyPurge, allowTTL, allowMsgCounter, allowMsgSchedules, discard, discardNewPer, maxMsgSize, maxMsgs, maxMsgsPer, maxBytes); err != nil {
 			rollback()
 			b.cleanupLocked(batchId, batches)
 			batches.mu.Unlock()
@@ -7570,6 +7977,7 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 	s, js, jsa, st, r, tierName, outq, node := mset.srv, mset.js, mset.jsa, mset.cfg.Storage, mset.cfg.Replicas, mset.tier, mset.outq, mset.node
 	maxMsgSize, lseq := int(mset.cfg.MaxMsgSize), mset.lseq
 	isLeader, isClustered, isSealed, allowRollup, denyPurge, allowTTL, allowMsgCounter, allowMsgSchedules, allowBatchPublish := mset.isLeader(), mset.isClustered(), mset.cfg.Sealed, mset.cfg.AllowRollup, mset.cfg.DenyPurge, mset.cfg.AllowMsgTTL, mset.cfg.AllowMsgCounter, mset.cfg.AllowMsgSchedules, mset.cfg.AllowBatchPublish
+	subjectVersioning := mset.cfg.subjectVersioningEnabled()
 
 	// Apply the input subject transform if any
 	csubject := subject
@@ -7579,6 +7987,10 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 			// no filtering: if the subject doesn't map the source of the transform, don't change it
 			csubject = ts
 		}
+	}
+	subjectVersionKey := _EMPTY_
+	if subjectVersioning {
+		subjectVersionKey = mset.subjectVersionKey(csubject)
 	}
 	mset.mu.RUnlock()
 
@@ -7826,7 +8238,11 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 		err    error
 	)
 	diff := &batchStagedDiff{}
-	if hdr, msg, dseq, apiErr, err = checkMsgHeadersPreClusteredProposal(diff, mset, csubject, subject, hdr, msg, false, name, jsa, allowRollup, denyPurge, allowTTL, allowMsgCounter, allowMsgSchedules, discard, discardNewPer, maxMsgSize, maxMsgs, maxMsgsPer, maxBytes); err != nil {
+	subjectVersionSeen := false
+	if subjectVersionKey != _EMPTY_ {
+		_, subjectVersionSeen = b.subjectVersions[subjectVersionKey]
+	}
+	if hdr, msg, dseq, apiErr, err = checkMsgHeadersPreClusteredProposal(diff, mset, csubject, subject, subjectVersionKey, subjectVersionSeen, hdr, msg, false, name, jsa, allowRollup, denyPurge, allowTTL, allowMsgCounter, allowMsgSchedules, discard, discardNewPer, maxMsgSize, maxMsgs, maxMsgsPer, maxBytes); err != nil {
 		mset.clMu.Unlock()
 
 		// If the message is a duplicate, and we have no pending messages, we should check if we need to
@@ -7847,10 +8263,7 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 		if !batch.gapOk && b.lseq == 1 {
 			var response []byte
 			if err == errMsgIdDuplicate && dseq > 0 {
-				var buf [256]byte
-				response = append(buf[:0], mset.pubAck...)
-				response = append(response, strconv.FormatUint(dseq, 10)...)
-				response = append(response, fmt.Sprintf(",\"duplicate\": true,\"batch\":%q,\"count\":%d}", batch.id, batch.seq)...)
+				response = mset.duplicatePubAckResponse(dseq, batch.id, batch.seq)
 			} else {
 				response, _ = json.Marshal(&JSPubAckResponse{PubAck: &PubAck{Stream: name}, Error: apiErr})
 			}
@@ -7887,6 +8300,12 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 		}
 		batches.mu.Unlock()
 		return err
+	}
+	if subjectVersionKey != _EMPTY_ {
+		if b.subjectVersions == nil {
+			b.subjectVersions = make(map[string]struct{}, 1)
+		}
+		b.subjectVersions[subjectVersionKey] = struct{}{}
 	}
 	b.pending++
 	batches.mu.Unlock()
