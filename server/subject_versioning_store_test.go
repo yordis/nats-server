@@ -454,6 +454,123 @@ func TestFileStoreSubjectVersionStateRebuildsAfterCheckpointAheadOfStream(t *tes
 	reopened.mu.RUnlock()
 }
 
+func TestFileStoreSubjectVersionStateRebuildsFromCorruption(t *testing.T) {
+	tests := []struct {
+		name   string
+		damage func(valid []byte) []byte
+	}{
+		{
+			name: "truncated-mid-entry",
+			damage: func(valid []byte) []byte {
+				if len(valid) < 4 {
+					return valid
+				}
+				return valid[:len(valid)-3]
+			},
+		},
+		{
+			name: "trailing-garbage",
+			damage: func(valid []byte) []byte {
+				return append(valid, 0xde, 0xad, 0xbe, 0xef)
+			},
+		},
+		{
+			name: "wrong-magic-byte",
+			damage: func(valid []byte) []byte {
+				out := append([]byte(nil), valid...)
+				out[0] = subjectVersionMagic + 1
+				return out
+			},
+		},
+		{
+			name: "wrong-version-byte",
+			damage: func(valid []byte) []byte {
+				out := append([]byte(nil), valid...)
+				out[1] = subjectVersionVer + 1
+				return out
+			},
+		},
+		{
+			name: "empty-file",
+			damage: func(valid []byte) []byte { return nil },
+		},
+		{
+			name: "header-only",
+			damage: func(valid []byte) []byte {
+				return valid[:2]
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testSubjectVersioningStreamConfig("SV_FILE_CORRUPT_"+tc.name, FileStorage)
+			dir := t.TempDir()
+
+			fs, err := newFileStore(FileStoreConfig{StoreDir: dir}, cfg)
+			require_NoError(t, err)
+
+			for i := 0; i < 4; i++ {
+				hdr := genHeader(nil, JSSubjectVersion, fmt.Sprintf("%d", i))
+				hdr = genHeader(hdr, JSSubjectVersionKey, "events.order.999")
+				_, _, err = fs.StoreMsg("events.order.999.step", hdr, []byte("payload"), 0)
+				require_NoError(t, err)
+			}
+			require_NoError(t, fs.forceWriteFullState())
+
+			checkpoint := filepath.Join(dir, msgDir, subjectVersionStateFile)
+			valid, err := os.ReadFile(checkpoint)
+			require_NoError(t, err)
+			require_NoError(t, fs.Stop())
+
+			damaged := tc.damage(valid)
+			require_NoError(t, os.WriteFile(checkpoint, damaged, 0o644))
+
+			reopened, err := newFileStore(FileStoreConfig{StoreDir: dir}, cfg)
+			require_NoError(t, err)
+			defer reopened.Stop()
+
+			reopened.mu.RLock()
+			sv, ok := reopened.svs.Find([]byte("events.order.999"))
+			reopened.mu.RUnlock()
+			require_True(t, ok)
+			require_Equal(t, sv.lastVersion, uint64(3))
+			require_Equal(t, sv.lastSeq, uint64(4))
+		})
+	}
+}
+
+func TestFileStoreSubjectVersionStateWriteFailureDoesNotCorruptInMemoryState(t *testing.T) {
+	cfg := testSubjectVersioningStreamConfig("SV_FILE_DISKFULL", FileStorage)
+	dir := t.TempDir()
+
+	fs, err := newFileStore(FileStoreConfig{StoreDir: dir}, cfg)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	for i := 0; i < 2; i++ {
+		hdr := genHeader(nil, JSSubjectVersion, fmt.Sprintf("%d", i))
+		hdr = genHeader(hdr, JSSubjectVersionKey, "events.order.555")
+		_, _, err = fs.StoreMsg("events.order.555.step", hdr, []byte("payload"), 0)
+		require_NoError(t, err)
+	}
+
+	// Simulate "disk full at checkpoint time" by removing the parent directory
+	// the writer expects. writeFileWithOptionalSync will fail; the in-memory
+	// svs must still reflect the two stored messages.
+	require_NoError(t, os.RemoveAll(filepath.Join(dir, msgDir)))
+
+	err = fs.writeSubjectVersionState()
+	require_Error(t, err)
+
+	fs.mu.RLock()
+	sv, ok := fs.svs.Find([]byte("events.order.555"))
+	fs.mu.RUnlock()
+	require_True(t, ok)
+	require_Equal(t, sv.lastVersion, uint64(1))
+	require_Equal(t, sv.lastSeq, uint64(2))
+}
+
 func TestFileStoreSubjectVersionStateRecoversFromCheckpoint(t *testing.T) {
 	cfg := testSubjectVersioningStreamConfig("SV_FILE", FileStorage)
 	dir := t.TempDir()
