@@ -18,6 +18,8 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"testing"
@@ -377,6 +379,181 @@ func TestJetStreamClusterSubjectVersioningSurvivesLeaderChange(t *testing.T) {
 	require_Equal(t, duplicateAck.SubjectVersionKey, "events.order.123")
 	require_Equal(t, duplicateAck.Sequence, firstAck.Sequence)
 	require_NotEqual(t, currentLeader, c.streamLeader(globalAccountName, cfg.Name))
+}
+
+// TestJetStreamClusterSubjectVersioningHealthyClusterConvergesSVS asserts the
+// foundational property the rolling-upgrade story depends on: in a healthy
+// R3 cluster, every replica's svs state is byte-for-byte identical for every
+// tracked namespace after a sequence of publishes. If this invariant ever
+// breaks, no upgrade scenario can be safe.
+func TestJetStreamClusterSubjectVersioningHealthyClusterConvergesSVS(t *testing.T) {
+	c := createSubjectVersioningCluster(t, "SVCONV", 3)
+	defer c.shutdown()
+
+	nc, _ := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	cfg := testSubjectVersioningStreamConfig("SV_CLUSTER_CONVERGE", FileStorage)
+	cfg.Replicas = 3
+	_, err := jsStreamCreate(t, nc, &cfg)
+	require_NoError(t, err)
+
+	expectations := map[string]uint64{
+		"events.order.123":   0,
+		"events.invoice.900": 0,
+	}
+	publish := func(t *testing.T, key, leaf string) {
+		t.Helper()
+		msg := nats.NewMsg(key + "." + leaf)
+		ack := requestSubjectVersioningPubAck(t, nc, msg)
+		require_NotNil(t, ack.SubjectVersion)
+		require_Equal(t, ack.SubjectVersionKey, key)
+		require_Equal(t, *ack.SubjectVersion, expectations[key])
+		expectations[key]++
+	}
+
+	for i := 0; i < 4; i++ {
+		publish(t, "events.order.123", fmt.Sprintf("step%d", i))
+		publish(t, "events.invoice.900", fmt.Sprintf("step%d", i))
+	}
+
+	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+		for _, s := range c.servers {
+			mset, err := s.GlobalAccount().lookupStream(cfg.Name)
+			if err != nil {
+				return err
+			}
+			var state StreamState
+			mset.store.FastState(&state)
+			if state.LastSeq != 8 {
+				return fmt.Errorf("%s at seq %d, want 8", s.Name(), state.LastSeq)
+			}
+		}
+		return nil
+	})
+
+	for _, s := range c.servers {
+		mset, err := s.GlobalAccount().lookupStream(cfg.Name)
+		require_NoError(t, err)
+		fs, ok := mset.store.(*fileStore)
+		require_True(t, ok)
+		fs.mu.RLock()
+		for key, lastVersion := range expectations {
+			entry, found := fs.svs.Find([]byte(key))
+			if !found {
+				fs.mu.RUnlock()
+				t.Fatalf("%s missing svs entry for %s", s.Name(), key)
+			}
+			require_Equal(t, entry.lastVersion, lastVersion-1)
+		}
+		fs.mu.RUnlock()
+	}
+}
+
+// TestJetStreamClusterSubjectVersioningRollingUpgradeRecovery models the
+// rolling-upgrade scenario this fork actually cares about: a single node loses
+// its on-disk svs checkpoint (sver.db) while the cluster keeps running, then
+// restarts and must reconverge via the normal raft catch-up path. This is the
+// closest deterministic simulation of "node was running the old binary, gets
+// upgraded, must converge with the leader" without spinning two binaries in
+// one Go test.
+func TestJetStreamClusterSubjectVersioningRollingUpgradeRecovery(t *testing.T) {
+	c := createSubjectVersioningCluster(t, "SVUPGRADE", 3)
+	defer c.shutdown()
+
+	nc, _ := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	cfg := testSubjectVersioningStreamConfig("SV_CLUSTER_UPGRADE", FileStorage)
+	cfg.Replicas = 3
+	_, err := jsStreamCreate(t, nc, &cfg)
+	require_NoError(t, err)
+
+	for i := 0; i < 4; i++ {
+		msg := nats.NewMsg(fmt.Sprintf("events.order.123.step%d", i))
+		if i == 0 {
+			msg.Header.Set(JSExpectedLastSubjectVer, jsExpectedLastSubjectVersionNoStream)
+		} else {
+			msg.Header.Set(JSExpectedLastSubjectVer, fmt.Sprintf("%d", i-1))
+		}
+		ack := requestSubjectVersioningPubAck(t, nc, msg)
+		require_NotNil(t, ack.SubjectVersion)
+		require_Equal(t, *ack.SubjectVersion, uint64(i))
+	}
+
+	follower := c.randomNonStreamLeader(globalAccountName, cfg.Name)
+	require_NotNil(t, follower)
+	followerStream, err := follower.GlobalAccount().lookupStream(cfg.Name)
+	require_NoError(t, err)
+	followerFs, ok := followerStream.store.(*fileStore)
+	require_True(t, ok)
+	storeDir := followerFs.fcfg.StoreDir
+	follower.Shutdown()
+
+	// Drop the checkpoint while the node is down. This is what an "upgrade from
+	// a binary that never wrote sver.db" would look like on disk.
+	require_NoError(t, os.Remove(filepath.Join(storeDir, msgDir, subjectVersionStateFile)))
+
+	leader := c.streamLeader(globalAccountName, cfg.Name)
+	require_NotNil(t, leader)
+	leaderStream, err := leader.GlobalAccount().lookupStream(cfg.Name)
+	require_NoError(t, err)
+
+	// More writes while the upgrading node is offline.
+	for i := 4; i < 7; i++ {
+		msg := nats.NewMsg(fmt.Sprintf("events.order.123.step%d", i))
+		msg.Header.Set(JSExpectedLastSubjectVer, fmt.Sprintf("%d", i-1))
+		ack := requestSubjectVersioningPubAck(t, nc, msg)
+		require_NotNil(t, ack.SubjectVersion)
+		require_Equal(t, *ack.SubjectVersion, uint64(i))
+	}
+
+	// Force a snapshot so the rejoining node has to take both the snapshot
+	// install path AND the per-message header replay path during rebuild.
+	err = leaderStream.raftNode().InstallSnapshot(leaderStream.stateSnapshot(), false)
+	require_NoError(t, err)
+
+	follower = c.restartServer(follower)
+	c.waitOnServerHealthz(follower)
+	c.waitOnStreamCurrent(follower, globalAccountName, cfg.Name)
+
+	rejoinedStream, err := follower.GlobalAccount().lookupStream(cfg.Name)
+	require_NoError(t, err)
+	rejoinedFs, ok := rejoinedStream.store.(*fileStore)
+	require_True(t, ok)
+
+	// svs must rebuild from the replicated headers and match the leader.
+	rejoinedFs.mu.RLock()
+	rejoinedEntry, found := rejoinedFs.svs.Find([]byte("events.order.123"))
+	rejoinedFs.mu.RUnlock()
+	require_True(t, found)
+	require_Equal(t, rejoinedEntry.lastVersion, uint64(6))
+
+	leaderFs, ok := leaderStream.store.(*fileStore)
+	require_True(t, ok)
+	leaderFs.mu.RLock()
+	leaderEntry, leaderFound := leaderFs.svs.Find([]byte("events.order.123"))
+	leaderFs.mu.RUnlock()
+	require_True(t, leaderFound)
+	require_Equal(t, rejoinedEntry.lastVersion, leaderEntry.lastVersion)
+	require_Equal(t, rejoinedEntry.lastSeq, leaderEntry.lastSeq)
+
+	// Promote the rejoined node and verify the next assignment continues from
+	// the recovered svs rather than restarting the namespace.
+	req := JSApiLeaderStepdownRequest{Placement: &Placement{Preferred: follower.Name()}}
+	data, err := json.Marshal(req)
+	require_NoError(t, err)
+	_, err = nc.Request(fmt.Sprintf(JSApiStreamLeaderStepDownT, cfg.Name), data, time.Second)
+	require_NoError(t, err)
+	c.waitOnStreamLeader(globalAccountName, cfg.Name)
+	require_Equal(t, c.streamLeader(globalAccountName, cfg.Name), follower)
+
+	probe := nats.NewMsg("events.order.123.shipped")
+	probe.Header.Set(JSExpectedLastSubjectVer, "6")
+	probeAck := requestSubjectVersioningPubAck(t, nc, probe)
+	require_NotNil(t, probeAck.SubjectVersion)
+	require_Equal(t, *probeAck.SubjectVersion, uint64(7))
+	require_Equal(t, probeAck.SubjectVersionKey, "events.order.123")
 }
 
 func TestJetStreamClusterSubjectVersioningSurvivesClusterRestart(t *testing.T) {
