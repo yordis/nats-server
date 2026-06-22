@@ -222,6 +222,42 @@ func TestJetStreamSubjectVersioningExpectedLastSubjectVersion(t *testing.T) {
 	}
 }
 
+func TestJetStreamSubjectVersioningRemovalPathsAreUnreachable(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	cfg := testSubjectVersioningStreamConfig("SV_REMOVAL_BLOCKED", FileStorage)
+	_, err := jsStreamCreate(t, nc, &cfg)
+	require_NoError(t, err)
+
+	requestSubjectVersioningPubAck(t, nc, nats.NewMsg("events.order.123.created"))
+
+	// DeleteMsg must be rejected because DenyDelete is required by the
+	// subject-versioning config validator.
+	err = js.DeleteMsg(cfg.Name, 1)
+	require_Error(t, err)
+
+	// PurgeStream must be rejected because DenyPurge is required.
+	err = js.PurgeStream(cfg.Name)
+	require_Error(t, err)
+
+	// Confirm svs is intact (one namespace, version 0 still assigned).
+	mset, err := s.GlobalAccount().lookupStream(cfg.Name)
+	require_NoError(t, err)
+	info := mset.subjectVersioningInfo()
+	require_NotNil(t, info)
+	require_Equal(t, info.Namespaces, 1)
+
+	// And the next publish in that namespace still gets version 1, proving the
+	// counter was not perturbed by the rejected operations.
+	next := requestSubjectVersioningPubAck(t, nc, nats.NewMsg("events.order.123.updated"))
+	require_NotNil(t, next.SubjectVersion)
+	require_Equal(t, *next.SubjectVersion, uint64(1))
+}
+
 func TestJetStreamSubjectVersioningSubjectTransformFallback(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()

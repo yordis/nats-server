@@ -221,6 +221,76 @@ func TestJetStreamClusterAtomicBatchSubjectVersioningExpectedVersionFirstOnly(t 
 	require_Equal(t, nextAck.SubjectVersionKey, "events.order.123")
 }
 
+func TestJetStreamClusterAtomicBatchSubjectVersioningRollbackPreservesCounters(t *testing.T) {
+	c := createSubjectVersioningCluster(t, "SVROLLBACK", 3)
+	defer c.shutdown()
+
+	nc, _ := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	cfg := testSubjectVersioningStreamConfig("SV_CLUSTER_ROLLBACK", FileStorage)
+	cfg.Replicas = 3
+	cfg.AllowAtomicPublish = true
+	_, err := jsStreamCreate(t, nc, &cfg)
+	require_NoError(t, err)
+
+	// Seed both namespaces at version 0 outside the batch.
+	seedA := nats.NewMsg("events.order.123.created")
+	seedAAck := requestSubjectVersioningPubAck(t, nc, seedA)
+	require_NotNil(t, seedAAck.SubjectVersion)
+	require_Equal(t, *seedAAck.SubjectVersion, uint64(0))
+
+	seedB := nats.NewMsg("events.order.456.created")
+	seedBAck := requestSubjectVersioningPubAck(t, nc, seedB)
+	require_NotNil(t, seedBAck.SubjectVersion)
+	require_Equal(t, *seedBAck.SubjectVersion, uint64(0))
+
+	// Atomic batch of three messages where the second message references a
+	// namespace at the wrong expected version. The whole batch must be rolled
+	// back, including the bumps that would have been assigned to the OTHER
+	// namespace touched by the batch.
+	first := nats.NewMsg("events.order.123.updated")
+	first.Header.Set(JSExpectedLastSubjectVer, "0")
+	first.Header.Set(JSBatchId, "rollback-batch")
+	first.Header.Set(JSBatchSeq, "1")
+	require_NoError(t, nc.PublishMsg(first))
+
+	second := nats.NewMsg("events.order.456.updated")
+	second.Header.Set(JSExpectedLastSubjectVer, "99") // wrong on purpose
+	second.Header.Set(JSBatchId, "rollback-batch")
+	second.Header.Set(JSBatchSeq, "2")
+	require_NoError(t, nc.PublishMsg(second))
+
+	third := nats.NewMsg("events.order.123.cancelled")
+	third.Header.Set(JSExpectedLastSubjectVer, "1")
+	third.Header.Set(JSBatchId, "rollback-batch")
+	third.Header.Set(JSBatchSeq, "3")
+	third.Header.Set(JSBatchCommit, "1")
+	respMsg, err := nc.RequestMsg(third, time.Second)
+	require_NoError(t, err)
+
+	var pubAck JSPubAckResponse
+	require_NoError(t, json.Unmarshal(respMsg.Data, &pubAck))
+	require_NotNil(t, pubAck.Error)
+
+	// If the batch rolled back correctly, BOTH namespace counters are still at
+	// version 0 — proven by publishing with no_stream-equivalent preconditions
+	// derived from the seed values.
+	probeA := nats.NewMsg("events.order.123.recovery")
+	probeA.Header.Set(JSExpectedLastSubjectVer, "0")
+	probeAAck := requestSubjectVersioningPubAck(t, nc, probeA)
+	require_NotNil(t, probeAAck.SubjectVersion)
+	require_Equal(t, *probeAAck.SubjectVersion, uint64(1))
+	require_Equal(t, probeAAck.SubjectVersionKey, "events.order.123")
+
+	probeB := nats.NewMsg("events.order.456.recovery")
+	probeB.Header.Set(JSExpectedLastSubjectVer, "0")
+	probeBAck := requestSubjectVersioningPubAck(t, nc, probeB)
+	require_NotNil(t, probeBAck.SubjectVersion)
+	require_Equal(t, *probeBAck.SubjectVersion, uint64(1))
+	require_Equal(t, probeBAck.SubjectVersionKey, "events.order.456")
+}
+
 func TestJetStreamClusterAtomicBatchSubjectVersioningRejectsReservedHeaders(t *testing.T) {
 	headers := []string{JSSubjectVersion, JSSubjectVersionKey}
 	for _, header := range headers {

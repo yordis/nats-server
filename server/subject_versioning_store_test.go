@@ -90,6 +90,54 @@ func BenchmarkSubjectVersioningHighCardinalityStore(b *testing.B) {
 	}
 }
 
+func BenchmarkSubjectVersioningSustainedPublish(b *testing.B) {
+	const namespaces = 100_000
+
+	for _, storage := range []StorageType{MemoryStorage, FileStorage} {
+		b.Run(storage.String(), func(b *testing.B) {
+			cfg := testSubjectVersioningStreamConfig("SV_SOAK_"+storage.String(), storage)
+			var store StreamStore
+			switch storage {
+			case MemoryStorage:
+				ms, err := newMemStore(&cfg)
+				require_NoError(b, err)
+				store = ms
+			case FileStorage:
+				fs, err := newFileStore(FileStoreConfig{StoreDir: b.TempDir()}, cfg)
+				require_NoError(b, err)
+				store = fs
+			}
+			b.Cleanup(func() {
+				require_NoError(b, store.Stop())
+			})
+
+			payload := []byte("payload")
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				ns := i % namespaces
+				key := fmt.Sprintf("events.order.%d", ns)
+				hdr := genHeader(nil, JSSubjectVersion, fmt.Sprintf("%d", i/namespaces))
+				hdr = genHeader(hdr, JSSubjectVersionKey, key)
+				_, _, err := store.StoreMsg(key+".event", hdr, payload, 0)
+				require_NoError(b, err)
+			}
+			b.StopTimer()
+
+			switch store := store.(type) {
+			case *memStore:
+				store.mu.RLock()
+				b.ReportMetric(float64(store.svs.Size()), "namespaces")
+				store.mu.RUnlock()
+			case *fileStore:
+				store.mu.RLock()
+				b.ReportMetric(float64(store.svs.Size()), "namespaces")
+				store.mu.RUnlock()
+			}
+		})
+	}
+}
+
 func BenchmarkFileStoreSubjectVersionStateCheckpoint(b *testing.B) {
 	const namespaces = 10_000
 

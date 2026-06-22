@@ -3,8 +3,8 @@
 | Metadata | Value |
 | --- | --- |
 | Date | 2026-04-30 |
-| Status | Draft for maintainer discussion |
-| Tags | jetstream, server, subject-sequence, adr-draft |
+| Status | Committed on fork (`yordis/nats-server`); upstream merge not pursued |
+| Tags | jetstream, server, subject-sequence, fork |
 
 ## Context
 
@@ -50,7 +50,7 @@ With the example above:
 | `events.order.123.cancelled` | `events.order.123` | `1` |
 | `events.invoice.900.issued` | `events.invoice.900` | `0` |
 
-The proposed public name is still open. The branch currently uses `subject_versioning`, `Nats-Subject-Version`, and `Nats-Expected-Last-Subject-Version`, but a rename toward `subject_sequence` or subject namespace sequencing should happen only after maintainer preference is clear because it affects config, headers, generated errors, and tests.
+The public surface is committed: `subject_versioning` for the config field, `Nats-Subject-Version` and `Nats-Subject-Version-Key` for stored metadata, and `Nats-Expected-Last-Subject-Version` for the optimistic concurrency command. The natural alternative `subject_sequence` was rejected because it collides with the long-standing `Nats-Expected-Last-Subject-Sequence` header, which already means the stream's per-subject sequence and has different semantics.
 
 ## Namespace Derivation
 
@@ -233,12 +233,17 @@ High-cardinality usage increases:
 - file-store checkpoint size
 - restart catch-up work when checkpoints are stale
 
-Local benchmark on an Apple M4 Max using `-benchtime=10x`:
+Local benchmark on an Apple M4 Max:
 
 ```text
+# Cold-cache: -benchtime=10x
 BenchmarkSubjectVersioningHighCardinalityStore/Memory-14          5583 ns/op    1428 B/op  18 allocs/op
 BenchmarkSubjectVersioningHighCardinalityStore/File-14           12775 ns/op   27613 B/op  19 allocs/op
 BenchmarkFileStoreSubjectVersionStateCheckpoint-14              398067 ns/op  907932 B/op  32 allocs/op
+
+# Steady-state: 200k publishes across 100k namespaces (sustained-publish soak)
+BenchmarkSubjectVersioningSustainedPublish/Memory-14              961 ns/op     919 B/op  15 allocs/op  100000 namespaces
+BenchmarkSubjectVersioningSustainedPublish/File-14               2874 ns/op     776 B/op  15 allocs/op  100000 namespaces
 ```
 
 The current branch does not add a namespace-count guardrail. That should remain a maintainer/operator decision because a fixed v1 limit could reject legitimate workloads without production data.
@@ -284,10 +289,16 @@ Decorating messages on delivery avoids storing server-owned headers. It may fit 
 
 Consumer groups may eventually provide named behaviors and dynamic partitioning where sequencing can be attached to delivery. Waiting reduces immediate scope but leaves publishers without a committed namespace sequence in the current stream model.
 
-## Maintainer Decisions Needed
+## Decisions
 
-- Is storing server-owned metadata headers acceptable for this opt-in stream mode?
-- Should this stay a stream write-path feature, become a consumer/group feature, or be modeled as a generic transform/mutator?
-- What public naming should be used for config, headers, errors, and tests?
-- Should grouped namespace sequencing remain in v1, or should v1 be exact-subject only?
-- Should v1 include a high-cardinality namespace guardrail?
+These were settled before the feature shipped on this fork. They are recorded here so future readers don't relitigate them.
+
+- **Stored server-owned metadata headers are acceptable.** Replay, direct get, and duplicate publish acks all need the same committed metadata without recomputing policy at read time. Payloads are never mutated; only `Nats-Subject-Version` and `Nats-Subject-Version-Key` are stamped, and client-supplied versions of either are rejected.
+- **This is a stream write-path feature.** Generic transform/mutator and consumer-group decoration were considered (see "Alternatives") and rejected because neither satisfies replay, direct get, and duplicate-ack requirements without storing the same metadata anyway.
+- **Public naming is `subject_versioning` and friends.** `subject_sequence` was rejected because it collides with the existing `Nats-Expected-Last-Subject-Sequence` header.
+- **Grouped namespace sequencing ships.** Exact-subject-only would make the feature a thin wrapper over the existing per-subject sequence and miss the event-grouping use case that motivated it.
+- **No hard cardinality cap in v1.** Cost is bounded by the number of unique namespace keys in the stream; the feature is opt-in. Operators observe via `StreamInfo.subject_versioning.namespaces` and a cap can be added later as a pure addition without breaking existing streams.
+
+## Status
+
+This ADR records the design as committed on `yordis/nats-server`. Upstream merge into `nats-io/nats-server` is not being pursued; see `ACTION_ITEMS.md` §0 for the position and why the alternative designs (one-stream-per-aggregate-id with timestamp interleave) do not satisfy event-sourcing requirements.
