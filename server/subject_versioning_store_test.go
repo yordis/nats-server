@@ -491,7 +491,7 @@ func TestFileStoreSubjectVersionStateRebuildsFromCorruption(t *testing.T) {
 			},
 		},
 		{
-			name: "empty-file",
+			name:   "empty-file",
 			damage: func(valid []byte) []byte { return nil },
 		},
 		{
